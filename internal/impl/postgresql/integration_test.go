@@ -1,0 +1,2116 @@
+// Copyright 2024 Redpanda Data, Inc.
+//
+// Licensed as a Redpanda Enterprise file under the Redpanda Community
+// License (the "License"); you may not use this file except in compliance with
+// the License. You may obtain a copy of the License at
+//
+// https://github.com/redpanda-data/connect/v4/blob/main/licenses/rcl.md
+
+package pgstream
+
+import (
+	"context"
+	"database/sql"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"strconv"
+	"strings"
+	"sync"
+	"testing"
+	"time"
+
+	_ "github.com/lib/pq"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+
+	_ "github.com/redpanda-data/benthos/v4/public/components/io"
+	_ "github.com/redpanda-data/benthos/v4/public/components/pure"
+	"github.com/redpanda-data/benthos/v4/public/service"
+	"github.com/redpanda-data/benthos/v4/public/service/integration"
+
+	"github.com/redpanda-data/connect/v4/internal/asyncroutine"
+	"github.com/redpanda-data/connect/v4/internal/impl/postgresql/pgtest"
+	"github.com/redpanda-data/connect/v4/internal/license"
+
+	"github.com/testcontainers/testcontainers-go"
+	"github.com/testcontainers/testcontainers-go/wait"
+)
+
+func ResourceWithPostgreSQLVersion(t *testing.T, version string) (string, *pgtest.TestDB, error) {
+	ctr, err := testcontainers.Run(t.Context(), "postgres:"+version,
+		testcontainers.WithExposedPorts("5432/tcp"),
+		testcontainers.WithEnv(map[string]string{
+			"POSTGRES_PASSWORD": "l]YLSc|4[i56%{gY",
+			"POSTGRES_USER":     "user_name",
+			"POSTGRES_DB":       "dbname",
+		}),
+		testcontainers.WithCmd("postgres", "-c", "wal_level=logical"),
+		testcontainers.WithWaitStrategy(
+			wait.ForListeningPort("5432/tcp").WithStartupTimeout(2*time.Minute),
+		),
+	)
+	testcontainers.CleanupContainer(t, ctr)
+	require.NoError(t, err)
+
+	host, err := ctr.Host(t.Context())
+	require.NoError(t, err)
+	mp, err := ctr.MappedPort(t.Context(), "5432/tcp")
+	require.NoError(t, err)
+
+	password := "l]YLSc|4[i56%{gY"
+	databaseURL := fmt.Sprintf("user=user_name password=%s dbname=dbname sslmode=disable host=%s port=%s", password, host, mp.Port())
+
+	var db *sql.DB
+	require.Eventually(t, func() bool {
+		if db != nil {
+			db.Close()
+		}
+		if db, err = sql.Open("postgres", databaseURL); err != nil {
+			return false
+		}
+
+		if err = db.Ping(); err != nil {
+			db.Close()
+			db = nil
+			return false
+		}
+
+		var walLevel string
+		if err = db.QueryRow("SHOW wal_level").Scan(&walLevel); err != nil {
+			return false
+		}
+
+		var pgConfig string
+		if err = db.QueryRow("SHOW config_file").Scan(&pgConfig); err != nil {
+			return false
+		}
+
+		if walLevel != "logical" {
+			return false
+		}
+
+		_, err = db.Exec("CREATE TABLE IF NOT EXISTS flights (id serial PRIMARY KEY, name VARCHAR(50), created_at TIMESTAMP);")
+		if err != nil {
+			return false
+		}
+
+		// Creating table with complex PG types
+		_, err = db.Exec(`CREATE TABLE complex_types_example (
+			id SERIAL PRIMARY KEY,
+			json_data JSONB,
+			tags TEXT[],
+			ip_addr INET,
+			search_text TSVECTOR,
+			time_range TSRANGE,
+			location POINT,
+			uuid_col UUID,
+			int_array INTEGER[]
+		);`)
+		if err != nil {
+			return false
+		}
+
+		// This table explicitly uses identifiers that need quoting to ensure we work with those correctly.
+		_, err = db.Exec(`
+			CREATE TABLE IF NOT EXISTS "FlightsCompositePK" (
+				"ID" serial, "Seq" integer, "Name" VARCHAR(50), "CreatedAt" TIMESTAMP,
+				PRIMARY KEY ("ID", "Seq")
+			);`)
+		if err != nil {
+			return false
+		}
+
+		_, err = db.Exec("CREATE TABLE IF NOT EXISTS large_values (id serial PRIMARY KEY, value TEXT);")
+		if err != nil {
+			return false
+		}
+
+		_, err = db.Exec("CREATE TABLE IF NOT EXISTS seq (id serial PRIMARY KEY);")
+		if err != nil {
+			return false
+		}
+
+		// flights_non_streamed is a control table with data that should not be streamed or queried by snapshot streaming
+		_, err = db.Exec("CREATE TABLE IF NOT EXISTS flights_non_streamed (id serial PRIMARY KEY, name VARCHAR(50), created_at TIMESTAMP);")
+		if err != nil {
+			return false
+		}
+
+		// The incremental snapshot takes its tables from this table.
+		_, err = db.Exec("CREATE TABLE IF NOT EXISTS rpcn_signal (id serial PRIMARY KEY, type VARCHAR(32), data TEXT);")
+
+		return err == nil
+	}, 2*time.Minute, time.Second, "could not connect to postgres")
+	t.Cleanup(func() {
+		if db != nil {
+			_ = db.Close()
+		}
+	})
+
+	testDB := &pgtest.TestDB{DB: db}
+	return databaseURL, testDB, nil
+}
+
+func TestIntegrationPostgresNoTxnMarkers(t *testing.T) {
+	integration.CheckSkip(t)
+	t.Parallel()
+	databaseURL, db, err := ResourceWithPostgreSQLVersion(t, "16")
+	require.NoError(t, err)
+
+	require.NoError(t, err)
+
+	for i := range 10 {
+		f := pgtest.GetFakeFlightRecord()
+		_, err = db.Exec(`INSERT INTO "FlightsCompositePK" ("Seq", "Name", "CreatedAt") VALUES ($1, $2, $3);`, i, f.RealAddress.City, time.Unix(f.CreatedAt, 0).Format(time.RFC3339))
+		require.NoError(t, err)
+	}
+
+	template := fmt.Sprintf(`
+pg_stream:
+    dsn: %s
+    slot_name: test_slot_native_decoder
+    stream_snapshot: true
+    snapshot_batch_size: 5
+    schema: public
+    tables:
+       - '"FlightsCompositePK"'
+`, databaseURL)
+
+	streamOutBuilder := service.NewStreamBuilder()
+	require.NoError(t, streamOutBuilder.SetLoggerYAML(`level: DEBUG`))
+	require.NoError(t, streamOutBuilder.AddInputYAML(template))
+
+	var outBatches []string
+	var outBatchMut sync.Mutex
+	require.NoError(t, streamOutBuilder.AddBatchConsumerFunc(func(_ context.Context, mb service.MessageBatch) error {
+		outBatchMut.Lock()
+		defer outBatchMut.Unlock()
+		for _, msg := range mb {
+			msgBytes, err := msg.AsBytes()
+			require.NoError(t, err)
+			outBatches = append(outBatches, string(msgBytes))
+		}
+		return nil
+	}))
+
+	streamOut, err := streamOutBuilder.Build()
+	require.NoError(t, err)
+
+	license.InjectTestService(streamOut.Resources())
+
+	go func() {
+		_ = streamOut.Run(t.Context())
+	}()
+
+	assert.Eventually(t, func() bool {
+		outBatchMut.Lock()
+		defer outBatchMut.Unlock()
+		return len(outBatches) == 10
+	}, time.Second*25, time.Millisecond*100)
+
+	for i := 10; i < 20; i++ {
+		f := pgtest.GetFakeFlightRecord()
+		_, err = db.Exec(`INSERT INTO "FlightsCompositePK" ("Seq", "Name", "CreatedAt") VALUES ($1, $2, $3);`, i, f.RealAddress.City, time.Unix(f.CreatedAt, 0).Format(time.RFC3339))
+		require.NoError(t, err)
+		_, err = db.Exec(`INSERT INTO flights_non_streamed (name, created_at) VALUES ($1, $2);`, f.RealAddress.City, time.Unix(f.CreatedAt, 0).Format(time.RFC3339))
+		require.NoError(t, err)
+	}
+
+	assert.EventuallyWithT(t, func(c *assert.CollectT) {
+		outBatchMut.Lock()
+		defer outBatchMut.Unlock()
+		assert.Len(c, outBatches, 20, "got: %#v", outBatches)
+	}, time.Second*25, time.Millisecond*100)
+
+	require.NoError(t, streamOut.StopWithin(time.Second*10))
+
+	// Starting stream for the same replication slot should continue from the last LSN
+	// Meaning we must not receive any old messages again
+
+	streamOutBuilder = service.NewStreamBuilder()
+	require.NoError(t, streamOutBuilder.SetLoggerYAML(`level: OFF`))
+	require.NoError(t, streamOutBuilder.AddInputYAML(template))
+
+	outBatches = []string{}
+	require.NoError(t, streamOutBuilder.AddConsumerFunc(func(_ context.Context, m *service.Message) error {
+		msgBytes, err := m.AsBytes()
+		require.NoError(t, err)
+		outBatchMut.Lock()
+		outBatches = append(outBatches, string(msgBytes))
+		outBatchMut.Unlock()
+		return nil
+	}))
+
+	streamOut, err = streamOutBuilder.Build()
+	require.NoError(t, err)
+
+	license.InjectTestService(streamOut.Resources())
+
+	go func() {
+		_ = streamOut.Run(t.Context())
+	}()
+
+	time.Sleep(time.Second * 5)
+	for i := 20; i < 30; i++ {
+		f := pgtest.GetFakeFlightRecord()
+		_, err = db.Exec(`INSERT INTO "FlightsCompositePK" ("Seq", "Name", "CreatedAt") VALUES ($1, $2, $3);`, i, f.RealAddress.City, time.Unix(f.CreatedAt, 0).Format(time.RFC3339))
+		require.NoError(t, err)
+	}
+
+	assert.EventuallyWithT(t, func(c *assert.CollectT) {
+		outBatchMut.Lock()
+		defer outBatchMut.Unlock()
+		assert.Len(c, outBatches, 10, "got: %#v", outBatches)
+	}, time.Second*20, time.Millisecond*100)
+
+	require.NoError(t, streamOut.StopWithin(time.Second*10))
+}
+
+// TestIntegrationPostgresUnmarshalableRowRoutedWithError verifies that a row
+// whose value cannot be marshalled to JSON (float8 NaN: the decoder passes it
+// through as a float64, which encoding/json rejects) is published with its
+// error set - inspectable and routable by error-handling components - while
+// the stream keeps moving. The original bug silently dropped the row and
+// checkpointed past it; the interim fix stalled the stream (restart loop,
+// with the stalled slot blocking WAL retention). See CON-504.
+func TestIntegrationPostgresUnmarshalableRowRoutedWithError(t *testing.T) {
+	integration.CheckSkip(t)
+	t.Parallel()
+	databaseURL, db, err := ResourceWithPostgreSQLVersion(t, "16")
+	require.NoError(t, err)
+
+	_, err = db.Exec("CREATE TABLE IF NOT EXISTS nan_floats (id serial PRIMARY KEY, value DOUBLE PRECISION);")
+	require.NoError(t, err)
+
+	template := fmt.Sprintf(`
+pg_stream:
+    dsn: %s
+    slot_name: test_slot_marshal_failure
+    stream_snapshot: false
+    schema: public
+    tables:
+       - nan_floats
+`, databaseURL)
+
+	type receivedMsg struct {
+		body    string
+		errored bool
+		errText string
+	}
+	var (
+		receivedMu sync.Mutex
+		received   []receivedMsg
+	)
+	builder := service.NewStreamBuilder()
+	require.NoError(t, builder.SetLoggerYAML(`level: OFF`))
+	require.NoError(t, builder.AddInputYAML(template))
+	require.NoError(t, builder.AddConsumerFunc(func(_ context.Context, m *service.Message) error {
+		b, err := m.AsBytes()
+		if err != nil {
+			return err
+		}
+		rm := receivedMsg{body: string(b)}
+		if mErr := m.GetError(); mErr != nil {
+			rm.errored = true
+			rm.errText = mErr.Error()
+		}
+		receivedMu.Lock()
+		received = append(received, rm)
+		receivedMu.Unlock()
+		return nil
+	}))
+	stream, err := builder.Build()
+	require.NoError(t, err)
+	license.InjectTestService(stream.Resources())
+	go func() { _ = stream.Run(t.Context()) }()
+
+	// Streaming-only mode only sees rows inserted after the replication slot
+	// exists: poll for the slot instead of sleeping, which is flaky on loaded
+	// runners.
+	require.Eventually(t, func() bool {
+		var one int
+		return db.QueryRow("SELECT 1 FROM pg_replication_slots WHERE slot_name = 'test_slot_marshal_failure'").Scan(&one) == nil
+	}, 30*time.Second, 250*time.Millisecond, "replication slot was never created")
+
+	// Sentinel row proves the stream is live before the poison row arrives.
+	_, err = db.Exec("INSERT INTO nan_floats (value) VALUES (1.5);")
+	require.NoError(t, err)
+	require.Eventually(t, func() bool {
+		receivedMu.Lock()
+		defer receivedMu.Unlock()
+		return len(received) == 1
+	}, 30*time.Second, 100*time.Millisecond, "sentinel row was never streamed - stream not live")
+
+	// Poison row (unmarshalable), then a normal row behind it.
+	_, err = db.Exec("INSERT INTO nan_floats (value) VALUES ('NaN'::double precision);")
+	require.NoError(t, err)
+	_, err = db.Exec("INSERT INTO nan_floats (value) VALUES (2.5);")
+	require.NoError(t, err)
+
+	// The core guarantee: every row is delivered in order - the unmarshalable
+	// one flagged with its error, the rows after it unaffected. (The original
+	// bug dropped the NaN row silently; the interim fix stalled the stream.)
+	require.Eventually(t, func() bool {
+		receivedMu.Lock()
+		defer receivedMu.Unlock()
+		return len(received) == 3
+	}, 30*time.Second, 100*time.Millisecond, "all three rows must be delivered, the unmarshalable one included")
+
+	receivedMu.Lock()
+	got := append([]receivedMsg(nil), received...)
+	receivedMu.Unlock()
+	require.Contains(t, got[0].body, "1.5")
+	require.False(t, got[0].errored, "a normal row must not carry an error")
+	require.True(t, got[1].errored, "the unmarshalable row must be published with its error set")
+	require.Contains(t, got[1].errText, "nan_floats", "the error must name the table")
+	require.Contains(t, got[1].body, "NaN", "the fallback payload must render the row for inspection")
+	require.Contains(t, got[2].body, "2.5")
+	require.False(t, got[2].errored)
+
+	require.NoError(t, stream.StopWithin(30*time.Second))
+}
+
+// TestIntegrationPostgresSnapshotAckBarrier verifies that a crash during the
+// snapshot->stream handoff (after snapshot rows are emitted but before they are
+// acknowledged) does not lose data: because the replication slot is only
+// promoted once every snapshot message is acked, the snapshot must re-run on
+// restart. See CON-489.
+func TestIntegrationPostgresSnapshotAckBarrier(t *testing.T) {
+	integration.CheckSkip(t)
+	t.Parallel()
+	databaseURL, db, err := ResourceWithPostgreSQLVersion(t, "16")
+	require.NoError(t, err)
+
+	const rowCount = 5
+	for i := range rowCount {
+		f := pgtest.GetFakeFlightRecord()
+		_, err = db.Exec(`INSERT INTO "FlightsCompositePK" ("Seq", "Name", "CreatedAt") VALUES ($1, $2, $3);`, i, f.RealAddress.City, time.Unix(f.CreatedAt, 0).Format(time.RFC3339))
+		require.NoError(t, err)
+	}
+
+	// batching.count == rowCount forces all snapshot rows into a single output
+	// batch, so the run-1 consumer receives them all at once and can then block
+	// without acking - reproducing the "emitted but not yet acked" handoff state.
+	template := fmt.Sprintf(`
+pg_stream:
+    dsn: %s
+    slot_name: test_slot_snapshot_ack_barrier
+    stream_snapshot: true
+    snapshot_batch_size: 1000
+    schema: public
+    tables:
+       - '"FlightsCompositePK"'
+    batching:
+      count: %d
+      period: 1h
+`, databaseURL, rowCount)
+
+	// Run 1: receive the snapshot rows but never acknowledge them, then simulate
+	// a crash by cancelling the run before the slot can be promoted.
+	received := make(chan struct{}, 1)
+	run1Builder := service.NewStreamBuilder()
+	require.NoError(t, run1Builder.SetLoggerYAML(`level: OFF`))
+	require.NoError(t, run1Builder.AddInputYAML(template))
+	require.NoError(t, run1Builder.AddBatchConsumerFunc(func(ctx context.Context, _ service.MessageBatch) error {
+		select {
+		case received <- struct{}{}:
+		default:
+		}
+		// Block without acking until the simulated crash cancels our context.
+		<-ctx.Done()
+		return ctx.Err()
+	}))
+	run1, err := run1Builder.Build()
+	require.NoError(t, err)
+	license.InjectTestService(run1.Resources())
+
+	run1Ctx, crash := context.WithCancel(context.Background())
+	run1Done := make(chan struct{})
+	go func() {
+		defer close(run1Done)
+		_ = run1.Run(run1Ctx)
+	}()
+
+	select {
+	case <-received:
+	case <-time.After(30 * time.Second):
+		t.Fatal("snapshot rows were never delivered to the run-1 output")
+	}
+	// Give the stream time to reach the ack barrier (and, in the buggy version,
+	// to promote the slot) before we crash.
+	time.Sleep(2 * time.Second)
+	crash()
+	select {
+	case <-run1Done:
+	case <-time.After(30 * time.Second):
+		t.Fatal("run 1 did not stop after the simulated crash")
+	}
+
+	// The barrier must have prevented the temporary slot from being promoted to
+	// a permanent one, since the snapshot was never acknowledged. This is the
+	// core guarantee: without it the permanent slot would exist here and the
+	// snapshot would be skipped on restart.
+	var permanentSlots int
+	require.NoError(t, db.QueryRow(`SELECT count(*) FROM pg_replication_slots WHERE slot_name = 'test_slot_snapshot_ack_barrier'`).Scan(&permanentSlots))
+	require.Zero(t, permanentSlots, "replication slot must not be promoted before snapshot rows are acknowledged")
+
+	// A real process crash drops the connection, so postgres releases the
+	// temporary snapshot slot promptly (the socket close is immediate at the
+	// OS level). Our in-process cancel does not: confirmed empirically, the
+	// slot still reports "active for PID ..." 30+ seconds after run1Ctx is
+	// cancelled, since Go's graceful shutdown path doesn't force-close the
+	// underlying connection that fast. Terminate the backend still holding the
+	// temporary slot to faithfully model the crash's prompt socket teardown,
+	// and wait for the slot to be released before restarting.
+	require.Eventually(t, func() bool {
+		_, _ = db.Exec(`SELECT pg_terminate_backend(active_pid) FROM pg_replication_slots WHERE slot_name = 'test_slot_snapshot_ack_barrier_tmp' AND active_pid IS NOT NULL`)
+		var tmpSlots int
+		if err := db.QueryRow(`SELECT count(*) FROM pg_replication_slots WHERE slot_name = 'test_slot_snapshot_ack_barrier_tmp'`).Scan(&tmpSlots); err != nil {
+			return false
+		}
+		return tmpSlots == 0
+	}, 30*time.Second, 500*time.Millisecond, "temporary snapshot slot from the crashed run was not released")
+
+	// Run 2: restart against the same slot. Since run 1 never acked the
+	// snapshot, the slot must not have been promoted, so the snapshot re-runs
+	// and every row is delivered again. The temporary slot is already gone by
+	// this point, so Connect's drop-before-create guard (added for CON-489's
+	// review) takes its "does not exist" path here and proceeds straight to
+	// creating a fresh one - the guard's other path, dropping a slot that
+	// still exists but whose owning session has died without yet being
+	// reaped, isn't reachable from this harness (see comment above: emulating
+	// that state needs the same terminate-then-wait this test already does,
+	// which collapses it into the "does not exist" case by construction).
+	var mu sync.Mutex
+	var reads int
+	run2Builder := service.NewStreamBuilder()
+	require.NoError(t, run2Builder.SetLoggerYAML(`level: OFF`))
+	require.NoError(t, run2Builder.AddInputYAML(template))
+	require.NoError(t, run2Builder.AddConsumerFunc(func(_ context.Context, m *service.Message) error {
+		if op, _ := m.MetaGet("operation"); op == "read" { // ReadOpType: snapshot row
+			mu.Lock()
+			reads++
+			mu.Unlock()
+		}
+		return nil
+	}))
+	run2, err := run2Builder.Build()
+	require.NoError(t, err)
+	license.InjectTestService(run2.Resources())
+	go func() { _ = run2.Run(t.Context()) }()
+
+	require.EventuallyWithT(t, func(c *assert.CollectT) {
+		mu.Lock()
+		defer mu.Unlock()
+		assert.Equal(c, rowCount, reads, "snapshot should have re-run and re-delivered every row after the crash")
+	}, 30*time.Second, 100*time.Millisecond)
+
+	require.NoError(t, run2.StopWithin(10*time.Second))
+}
+
+func TestIntegrationPgStreamingFromRemoteDB(t *testing.T) {
+	t.Skip("This test requires a remote database to run. Aimed to test remote databases")
+
+	// tables: users, products, orders, order_items
+
+	template := `
+pg_stream:
+    dsn: postgres://postgres:postgres@localhost:5432/postgres?sslmode=disable
+    slot_name: test_slot_native_decoder
+    snapshot_batch_size: 100000
+    stream_snapshot: true
+    include_transaction_markers: false
+    temporary_slot: true
+    schema: public
+    tables:
+       - users
+       - products
+       - orders
+       - order_items
+`
+
+	streamOutBuilder := service.NewStreamBuilder()
+	require.NoError(t, streamOutBuilder.SetLoggerYAML(`level: INFO`))
+	require.NoError(t, streamOutBuilder.AddInputYAML(template))
+
+	var outMessages int64
+	var outMessagesMut sync.Mutex
+
+	require.NoError(t, streamOutBuilder.AddBatchConsumerFunc(func(_ context.Context, mb service.MessageBatch) error {
+		_, err := mb[0].AsBytes()
+		require.NoError(t, err)
+		outMessagesMut.Lock()
+		outMessages += 1
+		outMessagesMut.Unlock()
+		return nil
+	}))
+
+	streamOut, err := streamOutBuilder.Build()
+	require.NoError(t, err)
+
+	license.InjectTestService(streamOut.Resources())
+
+	go func() {
+		_ = streamOut.Run(t.Context())
+	}()
+
+	assert.Eventually(t, func() bool {
+		outMessagesMut.Lock()
+		defer outMessagesMut.Unlock()
+		return outMessages == 200000
+	}, time.Minute*15, time.Millisecond*100)
+
+	t.Log("Backfill conditioins are met 🎉")
+
+	// you need to start inserting the data somewhere in another place
+	time.Sleep(time.Minute * 30)
+	outMessages = 0
+	assert.Eventually(t, func() bool {
+		outMessagesMut.Lock()
+		defer outMessagesMut.Unlock()
+		return outMessages == 1000000
+	}, time.Minute*15, time.Millisecond*100)
+
+	require.NoError(t, streamOut.StopWithin(time.Second*10))
+
+	require.NoError(t, streamOut.StopWithin(time.Second*10))
+}
+
+func TestIntegrationPostgresIncludeTxnMarkers(t *testing.T) {
+	integration.CheckSkip(t)
+	t.Parallel()
+	databaseURL, db, err := ResourceWithPostgreSQLVersion(t, "16")
+	require.NoError(t, err)
+
+	for range 10000 {
+		f := pgtest.GetFakeFlightRecord()
+		_, err = db.Exec("INSERT INTO flights (name, created_at) VALUES ($1, $2);", f.RealAddress.City, time.Unix(f.CreatedAt, 0).Format(time.RFC3339))
+		require.NoError(t, err)
+	}
+
+	template := fmt.Sprintf(`
+pg_stream:
+    dsn: %s
+    slot_name: test_slot_native_decoder
+    snapshot_batch_size: 100
+    stream_snapshot: true
+    include_transaction_markers: true
+    schema: public
+    tables:
+       - flights
+`, databaseURL)
+
+	streamOutBuilder := service.NewStreamBuilder()
+	require.NoError(t, streamOutBuilder.SetLoggerYAML(`level: DEBUG`))
+	require.NoError(t, streamOutBuilder.AddInputYAML(template))
+
+	var outBatches []string
+	var outBatchMut sync.Mutex
+	require.NoError(t, streamOutBuilder.AddBatchConsumerFunc(func(_ context.Context, mb service.MessageBatch) error {
+		outBatchMut.Lock()
+		defer outBatchMut.Unlock()
+		for _, msg := range mb {
+			msgBytes, err := msg.AsBytes()
+			require.NoError(t, err)
+			outBatches = append(outBatches, string(msgBytes))
+		}
+		return nil
+	}))
+
+	streamOut, err := streamOutBuilder.Build()
+	require.NoError(t, err)
+
+	license.InjectTestService(streamOut.Resources())
+
+	go func() {
+		if err := streamOut.Run(t.Context()); err != nil && !errors.Is(err, context.Canceled) {
+			assert.NoError(t, err)
+		}
+	}()
+
+	assert.Eventually(t, func() bool {
+		outBatchMut.Lock()
+		defer outBatchMut.Unlock()
+		return len(outBatches) == 10000
+	}, time.Second*25, time.Millisecond*100)
+
+	for range 10 {
+		f := pgtest.GetFakeFlightRecord()
+		_, err = db.Exec("INSERT INTO flights (name, created_at) VALUES ($1, $2);", f.RealAddress.City, time.Unix(f.CreatedAt, 0).Format(time.RFC3339))
+		require.NoError(t, err)
+		_, err = db.Exec("INSERT INTO flights_non_streamed (name, created_at) VALUES ($1, $2);", f.RealAddress.City, time.Unix(f.CreatedAt, 0).Format(time.RFC3339))
+		require.NoError(t, err)
+	}
+
+	assert.Eventually(t, func() bool {
+		outBatchMut.Lock()
+		defer outBatchMut.Unlock()
+		return len(outBatches) == 10030
+	}, time.Second*25, time.Millisecond*100)
+
+	require.NoError(t, streamOut.StopWithin(time.Second*10))
+
+	// Starting stream for the same replication slot should continue from the last LSN
+	// Meaning we must not receive any old messages again
+
+	streamOutBuilder = service.NewStreamBuilder()
+	require.NoError(t, streamOutBuilder.SetLoggerYAML(`level: OFF`))
+	require.NoError(t, streamOutBuilder.AddInputYAML(template))
+
+	outBatches = []string{}
+	require.NoError(t, streamOutBuilder.AddConsumerFunc(func(_ context.Context, m *service.Message) error {
+		msgBytes, err := m.AsBytes()
+		require.NoError(t, err)
+		outBatchMut.Lock()
+		outBatches = append(outBatches, string(msgBytes))
+		outBatchMut.Unlock()
+		return nil
+	}))
+
+	streamOut, err = streamOutBuilder.Build()
+	require.NoError(t, err)
+
+	license.InjectTestService(streamOut.Resources())
+
+	go func() {
+		if err := streamOut.Run(t.Context()); err != nil && !errors.Is(err, context.Canceled) {
+			assert.NoError(t, err)
+		}
+	}()
+
+	time.Sleep(time.Second * 5)
+	for range 10 {
+		f := pgtest.GetFakeFlightRecord()
+		_, err = db.Exec("INSERT INTO flights (name, created_at) VALUES ($1, $2);", f.RealAddress.City, time.Unix(f.CreatedAt, 0).Format(time.RFC3339))
+		require.NoError(t, err)
+	}
+
+	assert.Eventually(t, func() bool {
+		outBatchMut.Lock()
+		defer outBatchMut.Unlock()
+		return len(outBatches) == 30
+	}, time.Second*20, time.Millisecond*100)
+
+	require.NoError(t, streamOut.StopWithin(time.Second*10))
+}
+
+func TestIntegrationPgCDCForPgOutputStreamComplexTypesPlugin(t *testing.T) {
+	integration.CheckSkip(t)
+	t.Parallel()
+	databaseURL, db, err := ResourceWithPostgreSQLVersion(t, "16")
+	require.NoError(t, err)
+
+	// inserting data
+	_, err = db.Exec(`INSERT INTO complex_types_example (
+		json_data,
+		tags,
+		ip_addr,
+		search_text,
+		time_range,
+		location,
+		uuid_col,
+		int_array
+	) VALUES (
+		'{"name": "test", "value": 42}'::jsonb,
+		ARRAY['tag1', 'tag2', 'tag3'],
+		'192.168.1.1',
+		to_tsvector('english', 'The quick brown fox jumps over the lazy dog'),
+		tsrange('2024-01-01', '2024-12-31'),
+		point(45.5, -122.6),
+		'a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11',
+		ARRAY[1, 2, 3, 4, 5]
+	);`)
+	require.NoError(t, err)
+
+	_, err = db.Exec(`INSERT INTO complex_types_example (json_data) VALUES ('{"nested":null}'::jsonb);`)
+	require.NoError(t, err)
+
+	template := fmt.Sprintf(`
+pg_stream:
+    dsn: %s
+    slot_name: test_slot_native_decoder
+    snapshot_batch_size: 100
+    stream_snapshot: true
+    include_transaction_markers: false
+    schema: public
+    tables:
+       - complex_types_example
+`, databaseURL)
+
+	streamOutBuilder := service.NewStreamBuilder()
+	require.NoError(t, streamOutBuilder.SetLoggerYAML(`level: DEBUG`))
+	require.NoError(t, streamOutBuilder.AddInputYAML(template))
+
+	var outBatches []string
+	var outBatchMut sync.Mutex
+	require.NoError(t, streamOutBuilder.AddConsumerFunc(func(_ context.Context, msg *service.Message) error {
+		msgBytes, err := msg.AsBytes()
+		require.NoError(t, err)
+		outBatchMut.Lock()
+		outBatches = append(outBatches, string(msgBytes))
+		outBatchMut.Unlock()
+		return nil
+	}))
+
+	streamOut, err := streamOutBuilder.Build()
+	require.NoError(t, err)
+
+	license.InjectTestService(streamOut.Resources())
+
+	go func() {
+		if err := streamOut.Run(t.Context()); err != nil && !errors.Is(err, context.Canceled) {
+			assert.NoError(t, err)
+		}
+	}()
+
+	require.Eventually(t, func() bool {
+		outBatchMut.Lock()
+		defer outBatchMut.Unlock()
+		return len(outBatches) == 2
+	}, time.Second*25, time.Millisecond*100)
+
+	// producing change to non-complex type to trigger replication and receive updated row so we can check the complex types again
+	// but after they have been produced by replication to ensure the consistency
+	_, err = db.Exec("UPDATE complex_types_example SET id = 3 WHERE id = 1")
+	require.NoError(t, err)
+	_, err = db.Exec("UPDATE complex_types_example SET id = 4 WHERE id = 2")
+	require.NoError(t, err)
+
+	assert.Eventually(t, func() bool {
+		outBatchMut.Lock()
+		defer outBatchMut.Unlock()
+		return len(outBatches) == 4
+	}, time.Second*25, time.Millisecond*100)
+
+	// replacing update with insert to remove replication messages type differences
+	// so we will be checking only the data
+	require.JSONEq(t, `{"id":1, "int_array":[1, 2, 3, 4, 5], "ip_addr":"192.168.1.1/32", "json_data":{"name":"test", "value":42}, "location": "(45.5,-122.6)", "search_text":"'brown':3 'dog':9 'fox':4 'jump':5 'lazi':8 'quick':2", "tags":["tag1", "tag2", "tag3"], "time_range": "[2024-01-01 00:00:00,2024-12-31 00:00:00)", "uuid_col":"a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11"}`, outBatches[0])
+	require.JSONEq(t, `{"id":2, "int_array":null, "ip_addr":null, "json_data":{"nested":null}, "location":null, "search_text":null, "tags":null, "time_range":null, "uuid_col":null}`, outBatches[1])
+	require.JSONEq(t, `{"id":3, "int_array":[1, 2, 3, 4, 5], "ip_addr":"192.168.1.1/32", "json_data":{"name":"test", "value":42}, "location": "(45.5,-122.6)", "search_text":"'brown':3 'dog':9 'fox':4 'jump':5 'lazi':8 'quick':2", "tags":["tag1", "tag2", "tag3"], "time_range": "[2024-01-01 00:00:00,2024-12-31 00:00:00)", "uuid_col":"a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11"}`, outBatches[2])
+	require.JSONEq(t, `{"id":4, "int_array":null, "ip_addr":null, "json_data":{"nested":null}, "location":null, "search_text":null, "tags":null, "time_range":null, "uuid_col":null}`, outBatches[3])
+
+	require.NoError(t, streamOut.StopWithin(time.Second*10))
+}
+
+func TestIntegrationMultiplePostgresVersions(t *testing.T) {
+	integration.CheckSkip(t)
+	t.Parallel()
+	// running tests in the look to test different PostgreSQL versions
+	for _, version := range []string{"17", "16", "15", "14", "13", "12"} {
+		v := version
+		t.Run(version, func(t *testing.T) {
+			t.Parallel()
+			databaseURL, db, err := ResourceWithPostgreSQLVersion(t, v)
+			require.NoError(t, err)
+			require.NoError(t, err)
+
+			for range 1000 {
+				f := pgtest.GetFakeFlightRecord()
+				_, err = db.Exec("INSERT INTO flights (name, created_at) VALUES ($1, $2);", f.RealAddress.City, time.Unix(f.CreatedAt, 0).Format(time.RFC3339))
+				require.NoError(t, err)
+			}
+
+			template := fmt.Sprintf(`
+pg_stream:
+    dsn: %s
+    slot_name: test_slot_native_decoder
+    stream_snapshot: true
+    include_transaction_markers: false
+     # This is intentionally with uppercase - we want to validate
+     # we treat identifiers the same as Postgres Queries.
+    schema: PuBliC
+    tables:
+       # This is intentionally with uppercase - we want to validate
+       # we treat identifiers the same as Postgres Queries.
+       - FLIGHTS
+`, databaseURL)
+
+			streamOutBuilder := service.NewStreamBuilder()
+			require.NoError(t, streamOutBuilder.SetLoggerYAML(`level: INFO`))
+			require.NoError(t, streamOutBuilder.AddInputYAML(template))
+
+			var outBatches []string
+			var outBatchMut sync.Mutex
+			require.NoError(t, streamOutBuilder.AddBatchConsumerFunc(func(_ context.Context, mb service.MessageBatch) error {
+				outBatchMut.Lock()
+				defer outBatchMut.Unlock()
+				for _, msg := range mb {
+					msgBytes, err := msg.AsBytes()
+					require.NoError(t, err)
+					outBatches = append(outBatches, string(msgBytes))
+				}
+				return nil
+			}))
+
+			streamOut, err := streamOutBuilder.Build()
+			require.NoError(t, err)
+
+			license.InjectTestService(streamOut.Resources())
+
+			go func() {
+				_ = streamOut.Run(t.Context())
+			}()
+
+			assert.Eventually(t, func() bool {
+				outBatchMut.Lock()
+				defer outBatchMut.Unlock()
+				return len(outBatches) == 1000
+			}, time.Minute, time.Millisecond*100)
+
+			for range 1000 {
+				f := pgtest.GetFakeFlightRecord()
+				_, err = db.Exec("INSERT INTO flights (name, created_at) VALUES ($1, $2);", f.RealAddress.City, time.Unix(f.CreatedAt, 0).Format(time.RFC3339))
+				require.NoError(t, err)
+				_, err = db.Exec("INSERT INTO flights_non_streamed (name, created_at) VALUES ($1, $2);", f.RealAddress.City, time.Unix(f.CreatedAt, 0).Format(time.RFC3339))
+				require.NoError(t, err)
+			}
+
+			assert.EventuallyWithT(t, func(c *assert.CollectT) {
+				outBatchMut.Lock()
+				defer outBatchMut.Unlock()
+				assert.Len(c, outBatches, 2000, "got: %d", len(outBatches))
+			}, time.Minute, time.Millisecond*100)
+
+			require.NoError(t, streamOut.StopWithin(time.Second*30))
+
+			// Starting stream for the same replication slot should continue from the last LSN
+			// Meaning we must not receive any old messages again
+
+			streamOutBuilder = service.NewStreamBuilder()
+			require.NoError(t, streamOutBuilder.SetLoggerYAML(`level: INFO`))
+			require.NoError(t, streamOutBuilder.AddInputYAML(template))
+
+			outBatches = []string{}
+			require.NoError(t, streamOutBuilder.AddConsumerFunc(func(_ context.Context, m *service.Message) error {
+				msgBytes, err := m.AsBytes()
+				require.NoError(t, err)
+				outBatchMut.Lock()
+				outBatches = append(outBatches, string(msgBytes))
+				outBatchMut.Unlock()
+				return nil
+			}))
+
+			streamOut, err = streamOutBuilder.Build()
+			require.NoError(t, err)
+
+			license.InjectTestService(streamOut.Resources())
+
+			go func() {
+				if err := streamOut.Run(t.Context()); err != nil && !errors.Is(err, context.Canceled) {
+					t.Error(err)
+				}
+			}()
+
+			time.Sleep(time.Second * 5)
+			for range 1000 {
+				f := pgtest.GetFakeFlightRecord()
+				_, err = db.Exec("INSERT INTO flights (name, created_at) VALUES ($1, $2);", f.RealAddress.City, time.Unix(f.CreatedAt, 0).Format(time.RFC3339))
+				require.NoError(t, err)
+			}
+
+			// Postgres logical replication provides at-least-once delivery.
+			// Upon reconnection to the same replication slot, a small number of
+			// messages from the tail of the previous session may be replayed if
+			// the final LSN ack did not reach Postgres before shutdown.
+			assert.EventuallyWithT(t, func(c *assert.CollectT) {
+				outBatchMut.Lock()
+				defer outBatchMut.Unlock()
+				assert.GreaterOrEqual(c, len(outBatches), 1000, "expected at least 1000 messages, got: %d", len(outBatches))
+			}, time.Minute, time.Millisecond*100)
+
+			// Verify we didn't receive a large number of duplicate messages from
+			// the previous session -- at most a handful may be replayed.
+			outBatchMut.Lock()
+			assert.LessOrEqual(t, len(outBatches), 1010, "too many duplicates replayed, got: %d", len(outBatches))
+			outBatchMut.Unlock()
+
+			require.NoError(t, streamOut.StopWithin(time.Second*30))
+		})
+	}
+}
+
+func TestIntegrationTOASTValues(t *testing.T) {
+	integration.CheckSkip(t)
+	t.Parallel()
+
+	for _, replicaIdentity := range []string{"FULL", "DEFAULT", "ALT_UNCHANGED_TOAST"} {
+		t.Run(replicaIdentity, func(t *testing.T) {
+			t.Parallel()
+			databaseURL, db, err := ResourceWithPostgreSQLVersion(t, "16")
+			require.NoError(t, err)
+
+			if replicaIdentity == "FULL" {
+				_, err = db.Exec(`ALTER TABLE large_values REPLICA IDENTITY FULL`)
+				require.NoError(t, err)
+			}
+
+			const stringSize = 400_000
+
+			require.NoError(t, err)
+
+			// Insert a large >1MiB value
+			_, err = db.Exec(`INSERT INTO large_values (id, value) VALUES ($1, $2);`, 1, strings.Repeat("foo", stringSize))
+			require.NoError(t, err)
+
+			template := strings.NewReplacer("$DSN", databaseURL).Replace(`
+pg_stream:
+    dsn: $DSN
+    slot_name: test_slot_native_decoder
+    stream_snapshot: true
+    snapshot_batch_size: 1
+    schema: public
+    tables:
+       - large_values
+`)
+			if replicaIdentity == "ALT_UNCHANGED_TOAST" {
+				template += `
+    unchanged_toast_value: '__redpanda_connect_unchanged_toast_yum__'
+      `
+			}
+
+			streamOutBuilder := service.NewStreamBuilder()
+			require.NoError(t, streamOutBuilder.SetLoggerYAML(`level: DEBUG`))
+			require.NoError(t, streamOutBuilder.AddInputYAML(template))
+
+			var outBatches []string
+			var outBatchMut sync.Mutex
+			require.NoError(t, streamOutBuilder.AddBatchConsumerFunc(func(_ context.Context, mb service.MessageBatch) error {
+				outBatchMut.Lock()
+				defer outBatchMut.Unlock()
+				for _, msg := range mb {
+					msgBytes, err := msg.AsBytes()
+					require.NoError(t, err)
+					outBatches = append(outBatches, string(msgBytes))
+				}
+				return nil
+			}))
+
+			streamOut, err := streamOutBuilder.Build()
+			require.NoError(t, err)
+
+			license.InjectTestService(streamOut.Resources())
+
+			go func() {
+				_ = streamOut.Run(t.Context())
+			}()
+
+			assert.Eventually(t, func() bool {
+				outBatchMut.Lock()
+				defer outBatchMut.Unlock()
+				return len(outBatches) == 1
+			}, time.Second*10, time.Millisecond*100)
+
+			_, err = db.Exec(`UPDATE large_values SET value=$1;`, strings.Repeat("bar", stringSize))
+			require.NoError(t, err)
+			_, err = db.Exec(`UPDATE large_values SET id=$1;`, 3)
+			require.NoError(t, err)
+			_, err = db.Exec(`DELETE FROM large_values`)
+			require.NoError(t, err)
+			_, err = db.Exec(`INSERT INTO large_values (id, value) VALUES ($1, $2);`, 2, strings.Repeat("qux", stringSize))
+			require.NoError(t, err)
+
+			assert.EventuallyWithT(t, func(c *assert.CollectT) {
+				outBatchMut.Lock()
+				defer outBatchMut.Unlock()
+				assert.Len(c, outBatches, 5, "got: %#v", outBatches)
+			}, time.Second*10, time.Millisecond*100)
+			require.JSONEq(t, `{"id":1, "value": "`+strings.Repeat("foo", stringSize)+`"}`, outBatches[0], "GOT: %s", outBatches[0])
+			require.JSONEq(t, `{"id":1, "value": "`+strings.Repeat("bar", stringSize)+`"}`, outBatches[1], "GOT: %s", outBatches[1])
+			switch replicaIdentity {
+			case "FULL":
+				require.JSONEq(t, `{"id":3, "value": "`+strings.Repeat("bar", stringSize)+`"}`, outBatches[2], "GOT: %s", outBatches[2])
+				require.JSONEq(t, `{"id":3, "value": "`+strings.Repeat("bar", stringSize)+`"}`, outBatches[3], "GOT: %s", outBatches[3])
+			case "DEFAULT":
+				require.JSONEq(t, `{"id":3, "value": null}`, outBatches[2], "GOT: %s", outBatches[2])
+				require.JSONEq(t, `{"id":3, "value": null}`, outBatches[3], "GOT: %s", outBatches[3])
+			default:
+				require.JSONEq(t, `{"id":3, "value": "__redpanda_connect_unchanged_toast_yum__"}`, outBatches[2], "GOT: %s", outBatches[2])
+				require.JSONEq(t, `{"id":3, "value": null}`, outBatches[3], "GOT: %s", outBatches[3])
+			}
+			require.JSONEq(t, `{"id":2, "value": "`+strings.Repeat("qux", stringSize)+`"}`, outBatches[4], "GOT: %s", outBatches[4])
+
+			require.NoError(t, streamOut.StopWithin(time.Second*10))
+		})
+	}
+}
+
+func TestIntegrationSnapshotConsistency(t *testing.T) {
+	integration.CheckSkip(t)
+	t.Parallel()
+	databaseURL, db, err := ResourceWithPostgreSQLVersion(t, "16")
+	require.NoError(t, err)
+
+	require.NoError(t, err)
+
+	template := fmt.Sprintf(`
+read_until:
+  # Stop when we're idle for 10 seconds, which means our writer stopped
+  idle_timeout: 10s
+  input:
+    pg_stream:
+        dsn: %s
+        slot_name: test_slot
+        stream_snapshot: true
+        snapshot_batch_size: 1
+        schema: public
+        tables:
+           - seq
+`, databaseURL)
+
+	streamOutBuilder := service.NewStreamBuilder()
+	require.NoError(t, streamOutBuilder.SetLoggerYAML(`level: DEBUG`))
+	require.NoError(t, streamOutBuilder.AddInputYAML(template))
+
+	var sequenceNumbers []int64
+	var batchMu sync.Mutex
+	require.NoError(t, streamOutBuilder.AddBatchConsumerFunc(func(_ context.Context, batch service.MessageBatch) error {
+		batchMu.Lock()
+		defer batchMu.Unlock()
+		for _, msg := range batch {
+			msg, err := msg.AsStructured()
+			if err != nil {
+				return err
+			}
+			seq, err := msg.(map[string]any)["id"].(json.Number).Int64()
+			if err != nil {
+				return err
+			}
+			sequenceNumbers = append(sequenceNumbers, seq)
+		}
+		return nil
+	}))
+
+	// Continuously write so there is a chance we skip data between snapshot and stream hand off.
+	var (
+		writerMu       sync.Mutex
+		lastInsertedID int64
+	)
+	writer := asyncroutine.NewPeriodic(time.Microsecond, func() {
+		var id int64
+		require.NoError(t, db.QueryRow("INSERT INTO seq DEFAULT VALUES RETURNING id").Scan(&id))
+		writerMu.Lock()
+		lastInsertedID = id
+		writerMu.Unlock()
+	})
+	writer.Start()
+	t.Cleanup(writer.Stop)
+
+	// Wait to write some values so there are some values in the snapshot
+	time.Sleep(10 * time.Millisecond)
+
+	// Now start our stream
+	streamOut, err := streamOutBuilder.Build()
+	require.NoError(t, err)
+	license.InjectTestService(streamOut.Resources())
+	streamStopped := make(chan any, 1)
+	go func() {
+		if err := streamOut.Run(t.Context()); err != nil && !errors.Is(err, context.Canceled) {
+			assert.NoError(t, err)
+		}
+		streamStopped <- nil
+	}()
+	// Let the writer write a little more
+	time.Sleep(5 * time.Second)
+	writer.Stop()
+
+	writerMu.Lock()
+	targetID := lastInsertedID
+	writerMu.Unlock()
+
+	// Wait for the consumer to actually observe the last write.
+	require.Eventually(t, func() bool {
+		batchMu.Lock()
+		defer batchMu.Unlock()
+		return len(sequenceNumbers) > 0 && sequenceNumbers[len(sequenceNumbers)-1] >= targetID
+	}, 30*time.Second, 50*time.Millisecond, "stream did not catch up to last write")
+
+	require.NoError(t, streamOut.StopWithin(10*time.Second))
+	select {
+	case <-streamStopped:
+	case <-time.After(30 * time.Second):
+		require.Fail(t, "stream did not complete in time")
+	}
+
+	// Read the actual committed count from the database rather than
+	// relying on the atomic counter, which can race with the last
+	// INSERT commit.
+	var dbCount int64
+	require.NoError(t, db.QueryRow("SELECT COUNT(*) FROM seq").Scan(&dbCount))
+
+	expected := []int64{}
+	for i := range dbCount {
+		expected = append(expected, i+1)
+	}
+	batchMu.Lock()
+	require.Equal(t, expected, sequenceNumbers)
+	batchMu.Unlock()
+}
+
+func TestIntegrationSnapshotParallel(t *testing.T) {
+	integration.CheckSkip(t)
+	t.Parallel()
+	databaseURL, db, err := ResourceWithPostgreSQLVersion(t, "16")
+	require.NoError(t, err)
+
+	// Pre-insert rows into both tables so both pipelines have snapshot data.
+	const numRows = 100
+	for range numRows {
+		_, err = db.Exec("INSERT INTO seq DEFAULT VALUES")
+		require.NoError(t, err)
+		_, err = db.Exec(`INSERT INTO flights (name, created_at) VALUES ('test', NOW())`)
+		require.NoError(t, err)
+	}
+
+	buildPipeline := func(slotName string) (*service.Stream, *[]int64, *sync.Mutex) {
+		// max_parallel_snapshot_tables: 2 exercises the parallel errgroup scan path within
+		// a single pipeline (two goroutines scanning seq and flights concurrently).
+		// Running two such pipelines simultaneously exercises the concurrent-pipeline scenario
+		// from the bug report.
+		tmpl := fmt.Sprintf(`
+read_until:
+  idle_timeout: 5s
+  input:
+    postgres_cdc:
+        dsn: %s
+        slot_name: %s
+        stream_snapshot: true
+        snapshot_batch_size: 10
+        max_parallel_snapshot_tables: 2
+        schema: public
+        tables:
+          - seq
+          - flights
+`, databaseURL, slotName)
+
+		builder := service.NewStreamBuilder()
+		require.NoError(t, builder.SetLoggerYAML(`level: DEBUG`))
+		require.NoError(t, builder.AddInputYAML(tmpl))
+
+		var mu sync.Mutex
+		var ids []int64
+		require.NoError(t, builder.AddBatchConsumerFunc(func(_ context.Context, batch service.MessageBatch) error {
+			mu.Lock()
+			defer mu.Unlock()
+			for _, msg := range batch {
+				data, err := msg.AsStructured()
+				if err != nil {
+					return err
+				}
+				if id, ok := data.(map[string]any)["id"]; ok {
+					n, err := id.(json.Number).Int64()
+					if err != nil {
+						return err
+					}
+					ids = append(ids, n)
+				}
+			}
+			return nil
+		}))
+
+		stream, err := builder.Build()
+		require.NoError(t, err)
+		license.InjectTestService(stream.Resources())
+		return stream, &ids, &mu
+	}
+
+	streamA, idsA, muA := buildPipeline("test_slot_parallel_a")
+	streamB, idsB, muB := buildPipeline("test_slot_parallel_b")
+
+	// Start both pipelines concurrently. With the bug, one or both will hang during
+	// the snapshot phase: their scanTableRange goroutines block on s.messages <- batch
+	// while holding open DB transactions, and the idle_timeout never fires because the
+	// pipeline is not yet in the streaming phase. The test will time out.
+	doneA := make(chan error, 1)
+	doneB := make(chan error, 1)
+	go func() { doneA <- streamA.Run(t.Context()) }()
+	go func() { doneB <- streamB.Run(t.Context()) }()
+
+	deadline := time.After(60 * time.Second)
+	select {
+	case err := <-doneA:
+		require.NoError(t, err)
+	case <-deadline:
+		require.Fail(t, "pipeline A timed out - concurrent snapshot deadlock suspected")
+	}
+	select {
+	case err := <-doneB:
+		require.NoError(t, err)
+	case <-deadline:
+		require.Fail(t, "pipeline B timed out - concurrent snapshot deadlock suspected")
+	}
+
+	// Both pipelines should have received all rows from both tables.
+	muA.Lock()
+	assert.Len(t, *idsA, numRows*2, "pipeline A did not receive all rows from both tables")
+	muA.Unlock()
+
+	muB.Lock()
+	assert.Len(t, *idsB, numRows*2, "pipeline B did not receive all rows from both tables")
+	muB.Unlock()
+}
+
+func TestIntegrationPostgresMetadata(t *testing.T) {
+	integration.CheckSkip(t)
+	t.Parallel()
+	databaseURL, db, err := ResourceWithPostgreSQLVersion(t, "16")
+	require.NoError(t, err)
+
+	require.NoError(t, err)
+
+	_, err = db.Exec(`ALTER TABLE flights REPLICA IDENTITY FULL`)
+	require.NoError(t, err)
+
+	_, err = db.Exec(`INSERT INTO "FlightsCompositePK" ("Seq", "Name", "CreatedAt") VALUES ($1, $2, $3);`, 1, "delta", "2006-01-02T15:04:05Z07:00")
+	require.NoError(t, err)
+	_, err = db.Exec(`INSERT INTO flights (name, created_at) VALUES ($1, $2);`, "delta", "2006-01-02T15:04:05Z07:00")
+	require.NoError(t, err)
+
+	template := fmt.Sprintf(`
+postgres_cdc:
+    dsn: %s
+    slot_name: test_slot_native_decoder
+    stream_snapshot: true
+    snapshot_batch_size: 5
+    schema: public
+    tables:
+      - '"FlightsCompositePK"'
+      - flights
+`, databaseURL)
+
+	streamOutBuilder := service.NewStreamBuilder()
+	require.NoError(t, streamOutBuilder.SetLoggerYAML(`level: DEBUG`))
+	require.NoError(t, streamOutBuilder.AddInputYAML(template))
+	require.NoError(t, streamOutBuilder.AddProcessorYAML(`mapping: 'root = @'`))
+
+	var outBatches []any
+	var outBatchMut sync.Mutex
+	require.NoError(t, streamOutBuilder.AddBatchConsumerFunc(func(_ context.Context, batch service.MessageBatch) error {
+		outBatchMut.Lock()
+		defer outBatchMut.Unlock()
+		for _, msg := range batch {
+			data, err := msg.AsStructured()
+			require.NoError(t, err)
+			d := data.(map[string]any)
+			if _, ok := d["lsn"]; ok {
+				d["lsn"] = "XXX/XXX" // Consistent LSN for assertions below
+			}
+			if ct, ok := d["commit_ts_ms"].(string); ok {
+				ms, err := strconv.ParseInt(ct, 10, 64)
+				assert.NoError(t, err, "commit_ts_ms should be a valid integer")
+				assert.Positive(t, ms, "commit_ts_ms should be a positive Unix ms timestamp")
+				d["commit_ts_ms"] = "SET"
+			}
+			if before, ok := d["before"].(map[string]any); ok {
+				op, _ := d["operation"].(string)
+				switch op {
+				case "update":
+					assert.Equal(t, "bravo", before["name"], "update: before.name should be the pre-update value")
+				case "delete":
+					assert.Equal(t, "charlie", before["name"], "delete: before.name should be the post-update, pre-delete value")
+				}
+				d["before"] = "SET"
+			}
+			delete(d, "schema") // Schema metadata tested separately in TestIntegrationPostgresCDCSchemaMetadata
+			outBatches = append(outBatches, data)
+		}
+		return nil
+	}))
+
+	streamOut, err := streamOutBuilder.Build()
+	require.NoError(t, err)
+
+	license.InjectTestService(streamOut.Resources())
+
+	go func() {
+		_ = streamOut.Run(t.Context())
+	}()
+
+	assert.Eventually(t, func() bool {
+		outBatchMut.Lock()
+		defer outBatchMut.Unlock()
+		return len(outBatches) == 2
+	}, time.Second*25, time.Millisecond*100)
+
+	_, err = db.Exec(`INSERT INTO "FlightsCompositePK" ("Seq", "Name", "CreatedAt") VALUES ($1, $2, $3);`, 2, "bravo", "2006-01-02T15:04:05Z07:00")
+	require.NoError(t, err)
+
+	var flightsID int
+	err = db.QueryRow(`INSERT INTO flights (name, created_at) VALUES ($1, $2) RETURNING id;`, "bravo", "2006-01-02T15:04:05Z07:00").Scan(&flightsID)
+	require.NoError(t, err)
+
+	_, err = db.Exec(`UPDATE flights SET name = $1 WHERE id = $2;`, "charlie", flightsID)
+	require.NoError(t, err)
+
+	_, err = db.Exec(`DELETE FROM flights WHERE id = $1;`, flightsID)
+	require.NoError(t, err)
+
+	assert.EventuallyWithT(t, func(c *assert.CollectT) {
+		outBatchMut.Lock()
+		defer outBatchMut.Unlock()
+		assert.Len(c, outBatches, 6, "got: %#v", outBatches)
+	}, time.Second*25, time.Millisecond*100)
+
+	require.ElementsMatch(
+		t,
+		outBatches,
+		[]any{
+			map[string]any{
+				"operation": "read",
+				"table":     "FlightsCompositePK",
+			},
+			map[string]any{
+				"operation": "read",
+				"table":     "flights",
+			},
+			map[string]any{
+				"operation":    "insert",
+				"table":        "FlightsCompositePK",
+				"lsn":          "XXX/XXX",
+				"commit_ts_ms": "SET",
+			},
+			map[string]any{
+				"operation":    "insert",
+				"table":        "flights",
+				"lsn":          "XXX/XXX",
+				"commit_ts_ms": "SET",
+			},
+			map[string]any{
+				"operation":    "update",
+				"table":        "flights",
+				"lsn":          "XXX/XXX",
+				"commit_ts_ms": "SET",
+				"before":       "SET",
+			},
+			map[string]any{
+				"operation":    "delete",
+				"table":        "flights",
+				"lsn":          "XXX/XXX",
+				"commit_ts_ms": "SET",
+				"before":       "SET",
+			},
+		},
+	)
+
+	require.NoError(t, streamOut.StopWithin(time.Second*10))
+}
+
+// TestIntegrationHeartbeatAdvancesSlotOnQuietTables makes sure that heartbeats move the slot forward when the
+// subscribed tables are quiet and other tables write to the WAL. Without heartbeats the slot gets no messages to
+// acknowledge, so confirmed_flush_lsn does not move and Postgres keeps all the WAL.
+func TestIntegrationHeartbeatAdvancesSlotOnQuietTables(t *testing.T) {
+	integration.CheckSkip(t)
+	t.Parallel()
+	databaseURL, db, err := ResourceWithPostgreSQLVersion(t, "16")
+	require.NoError(t, err)
+
+	const (
+		heartbeatSlot   = "test_slot_heartbeat"
+		noHeartbeatSlot = "test_slot_no_heartbeat"
+	)
+	inputYAML := func(slotName, heartbeatInterval string) string {
+		return fmt.Sprintf(`
+postgres_cdc:
+    dsn: %s
+    slot_name: %s
+    schema: public
+    heartbeat_interval: %s
+    pg_standby_timeout: 200ms
+    tables:
+      - seq
+`, databaseURL, slotName, heartbeatInterval)
+	}
+	heartbeatMsgs, _ := startTestStream(t, inputYAML(heartbeatSlot, "200ms"))
+	noHeartbeatMsgs, _ := startTestStream(t, inputYAML(noHeartbeatSlot, "0s"))
+
+	require.Eventually(t, func() bool {
+		var count int
+		// A logical slot shows in pg_replication_slots while its creation waits for running transactions, and its
+		// confirmed_flush_lsn stays NULL until then. Postgres then sets it to the consistent point. If targetLSN is
+		// captured before that point, the slot without heartbeats seems to pass targetLSN.
+		err := db.QueryRow("SELECT count(*) FROM pg_replication_slots WHERE slot_name IN ($1, $2) AND confirmed_flush_lsn IS NOT NULL", heartbeatSlot, noHeartbeatSlot).Scan(&count)
+		return err == nil && count == 2
+	}, 30*time.Second, 50*time.Millisecond, "replication slots were not ready to stream in time")
+
+	// Write only to a table that the inputs do not subscribe to.
+	for range 5 {
+		_, err := db.Exec("INSERT INTO flights_non_streamed (name, created_at) VALUES ('quiet', now())")
+		require.NoError(t, err)
+	}
+	var targetLSN string
+	require.NoError(t, db.QueryRow("SELECT pg_current_wal_lsn()::text").Scan(&targetLSN))
+
+	require.Eventually(t, func() bool { return slotPassedLSN(t, db, heartbeatSlot, targetLSN) }, 10*time.Second, 50*time.Millisecond,
+		"confirmed_flush_lsn of the heartbeat slot did not pass %s", targetLSN)
+	// The slot without heartbeats must not move: today the input acks only messages it receives.
+	// If this fails because the input now acks keepalives, heartbeats may no longer be needed. Update this test.
+	assert.False(t, slotPassedLSN(t, db, noHeartbeatSlot, targetLSN), "confirmed_flush_lsn of the slot without heartbeats passed %s", targetLSN)
+	assert.Zero(t, heartbeatMsgs.Len(), "input with heartbeats emitted messages, but the subscribed table is quiet")
+	assert.Zero(t, noHeartbeatMsgs.Len(), "input without heartbeats emitted messages, but the subscribed table is quiet")
+}
+
+// slotPassedLSN returns true if the confirmed_flush_lsn of the slot is after lsn.
+func slotPassedLSN(t *testing.T, db *pgtest.TestDB, slotName, lsn string) bool {
+	t.Helper()
+	var passed bool
+	query := "SELECT pg_wal_lsn_diff(confirmed_flush_lsn, $2) > 0 FROM pg_replication_slots WHERE slot_name = $1"
+	err := db.QueryRow(query, slotName, lsn).Scan(&passed)
+	assert.NoError(t, err)
+	return passed
+}
+
+func TestIntegrationPostgresCDCSchemaMetadata(t *testing.T) {
+	integration.CheckSkip(t)
+	t.Parallel()
+
+	databaseURL, db, err := ResourceWithPostgreSQLVersion(t, "16")
+	require.NoError(t, err)
+
+	t.Run("every column type maps to its common type", func(t *testing.T) {
+		// Create a table that exercises every distinct type mapping in pgTypeNameToCommonType,
+		// plus INET as a representative unknown type whose schema falls back to ANY.
+		_, err = db.Exec(`CREATE TABLE schema_test_table (
+		id              SERIAL PRIMARY KEY,
+		col_bool        BOOLEAN,
+		col_smallint    SMALLINT,
+		col_int         INTEGER,
+		col_bigint      BIGINT,
+		col_float4      REAL,
+		col_float8      DOUBLE PRECISION,
+		col_numeric     NUMERIC(10,2),
+		col_text        TEXT,
+		col_varchar     VARCHAR(100),
+		col_char        CHAR(10),
+		col_bytea       BYTEA,
+		col_date        DATE,
+		col_time        TIME,
+		col_timetz      TIMETZ,
+		col_timestamp   TIMESTAMP,
+		col_timestamptz TIMESTAMPTZ,
+		col_json        JSON,
+		col_jsonb       JSONB,
+		col_uuid        UUID,
+		col_inet        INET
+	)`)
+		require.NoError(t, err)
+
+		// Insert two rows before starting the stream so they arrive as snapshot reads.
+		_, err = db.Exec(`INSERT INTO schema_test_table
+		(col_bool, col_smallint, col_int, col_bigint, col_float4, col_float8,
+		 col_numeric, col_text, col_varchar, col_char, col_bytea, col_date,
+		 col_time, col_timetz, col_timestamp, col_timestamptz, col_json, col_jsonb,
+		 col_uuid, col_inet)
+		VALUES
+		(TRUE,  1, 10, 1000000000, 1.5, 3.14, 123.45, 'alice', 'hello', 'hi',
+		 '\x48656c6c6f', '2024-01-15', '10:00:00', '10:00:00+00',
+		 '2024-01-15 10:00:00', '2024-01-15 10:00:00+00',
+		 '{"k":1}', '{"k":1}', 'a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11', '10.0.0.1'),
+		(FALSE, 2, 20, 2000000000, 2.5, 6.28, 456.78, 'bob',   'world', 'bye',
+		 '\x576f726c64', '2024-06-01', '20:00:00', '20:00:00+00',
+		 '2024-06-01 20:00:00', '2024-06-01 20:00:00+00',
+		 '{"k":2}', '{"k":2}', 'b0eebc99-9c0b-4ef8-bb6d-6bb9bd380a22', '10.0.0.2')`)
+		require.NoError(t, err)
+
+		collector := &pgtest.SchemaMetadataCollector{}
+
+		sb := service.NewStreamBuilder()
+		require.NoError(t, sb.SetLoggerYAML(`level: WARN`))
+		require.NoError(t, sb.AddInputYAML(fmt.Sprintf(`
+postgres_cdc:
+    dsn: %s
+    slot_name: schema_test_slot
+    stream_snapshot: true
+    snapshot_batch_size: 10
+    schema: public
+    tables:
+      - schema_test_table
+`, databaseURL)))
+
+		require.NoError(t, sb.AddBatchConsumerFunc(collector.Consume))
+
+		streamOut, err := sb.Build()
+		require.NoError(t, err)
+		license.InjectTestService(streamOut.Resources())
+
+		go func() {
+			if err := streamOut.Run(t.Context()); err != nil && !errors.Is(err, context.Canceled) {
+				t.Error(err)
+			}
+		}()
+		t.Cleanup(func() {
+			require.NoError(t, streamOut.StopWithin(10*time.Second))
+		})
+
+		// --- Phase 1: snapshot + CDC schema check ---
+
+		// Wait for 2 snapshot rows.
+		assert.Eventually(t, func() bool {
+			return len(collector.Snapshot()) >= 2
+		}, 30*time.Second, 100*time.Millisecond)
+
+		// Insert 2 CDC rows.
+		_, err = db.Exec(`INSERT INTO schema_test_table
+		(col_bool, col_smallint, col_int, col_bigint, col_float4, col_float8,
+		 col_numeric, col_text, col_varchar, col_char, col_bytea, col_date,
+		 col_time, col_timetz, col_timestamp, col_timestamptz, col_json, col_jsonb,
+		 col_uuid, col_inet)
+		VALUES
+		(TRUE,  3, 30, 3000000000, 3.5, 9.42, 789.01, 'carol', 'foo', 'cat',
+		 '\x466f6f', '2024-09-01', '09:00:00', '09:00:00+00',
+		 '2024-09-01 09:00:00', '2024-09-01 09:00:00+00',
+		 '{"k":3}', '{"k":3}', 'c0eebc99-9c0b-4ef8-bb6d-6bb9bd380a33', '10.0.0.3'),
+		(FALSE, 4, 40, 4000000000, 4.5, 12.56, 111.22, 'dave', 'bar', 'dog',
+		 '\x426172', '2024-12-01', '15:00:00', '15:00:00+00',
+		 '2024-12-01 15:00:00', '2024-12-01 15:00:00+00',
+		 '{"k":4}', '{"k":4}', 'd0eebc99-9c0b-4ef8-bb6d-6bb9bd380a44', '10.0.0.4')`)
+		require.NoError(t, err)
+
+		// Wait for all 4 messages.
+		assert.Eventually(t, func() bool {
+			return len(collector.Snapshot()) >= 4
+		}, 30*time.Second, 100*time.Millisecond)
+
+		phase1 := collector.Snapshot()[:4]
+
+		// verifySchemaAllCols checks all 21 columns against their expected schema types.
+		verifySchemaAllCols := func(t *testing.T, schema map[string]any) {
+			t.Helper()
+			require.NotNil(t, schema)
+			assert.Equal(t, "schema_test_table", schema["name"])
+			assert.Equal(t, "OBJECT", schema["type"])
+
+			rawChildren, ok := schema["children"]
+			require.True(t, ok, "schema must have a children key")
+			children, ok := rawChildren.([]any)
+			require.True(t, ok, "children must be []any")
+			assert.Len(t, children, 21)
+
+			byName := make(map[string]string, len(children))
+			for _, c := range children {
+				child := c.(map[string]any)
+				byName[child["name"].(string)] = child["type"].(string)
+			}
+			assert.Equal(t, "INT32", byName["id"])
+			assert.Equal(t, "BOOLEAN", byName["col_bool"], "BOOLEAN column")
+			assert.Equal(t, "INT32", byName["col_smallint"], "SMALLINT column")
+			assert.Equal(t, "INT32", byName["col_int"], "INTEGER column")
+			assert.Equal(t, "INT64", byName["col_bigint"], "BIGINT column")
+			assert.Equal(t, "FLOAT32", byName["col_float4"], "REAL column")
+			assert.Equal(t, "FLOAT64", byName["col_float8"], "DOUBLE PRECISION column")
+			assert.Equal(t, "DECIMAL", byName["col_numeric"], "NUMERIC column")
+			assert.Equal(t, "STRING", byName["col_text"], "TEXT column")
+			assert.Equal(t, "STRING", byName["col_varchar"], "VARCHAR column")
+			assert.Equal(t, "STRING", byName["col_char"], "CHAR column")
+			assert.Equal(t, "BYTE_ARRAY", byName["col_bytea"], "BYTEA column")
+			assert.Equal(t, "TIMESTAMP", byName["col_date"], "DATE column")
+			assert.Equal(t, "STRING", byName["col_time"], "TIME column")
+			assert.Equal(t, "STRING", byName["col_timetz"], "TIMETZ column")
+			assert.Equal(t, "TIMESTAMP", byName["col_timestamp"], "TIMESTAMP column")
+			assert.Equal(t, "TIMESTAMP", byName["col_timestamptz"], "TIMESTAMPTZ column")
+			assert.Equal(t, "ANY", byName["col_json"], "JSON column")
+			assert.Equal(t, "ANY", byName["col_jsonb"], "JSONB column")
+			assert.Equal(t, "STRING", byName["col_uuid"], "UUID column")
+			assert.Equal(t, "ANY", byName["col_inet"], "INET (unknown type) column")
+		}
+
+		// Snapshot messages: operation=read, no lsn, schema present.
+		for i, cm := range phase1[:2] {
+			assert.Equal(t, "read", cm.Operation, "snapshot msg %d: wrong operation", i)
+			assert.Equal(t, "schema_test_table", cm.Table)
+			assert.Empty(t, cm.LSN, "snapshot msg %d: should have no lsn", i)
+			assert.True(t, cm.HasSchema, "snapshot msg %d: missing schema metadata", i)
+			verifySchemaAllCols(t, cm.Schema)
+		}
+
+		// CDC messages: operation=insert, lsn set, schema present.
+		for i, cm := range phase1[2:] {
+			assert.Equal(t, "insert", cm.Operation, "cdc msg %d: wrong operation", i)
+			assert.Equal(t, "schema_test_table", cm.Table)
+			assert.NotEmpty(t, cm.LSN, "cdc msg %d: should have an lsn", i)
+			assert.True(t, cm.HasSchema, "cdc msg %d: missing schema metadata", i)
+			verifySchemaAllCols(t, cm.Schema)
+		}
+
+		// --- Phase 2: DDL change invalidates the schema cache ---
+
+		_, err = db.Exec(`ALTER TABLE schema_test_table ADD COLUMN extra TEXT`)
+		require.NoError(t, err)
+
+		_, err = db.Exec(`INSERT INTO schema_test_table
+		(col_bool, col_smallint, col_int, col_bigint, col_float4, col_float8,
+		 col_numeric, col_text, col_varchar, col_char, col_bytea, col_date,
+		 col_time, col_timetz, col_timestamp, col_timestamptz, col_json, col_jsonb,
+		 col_uuid, col_inet, extra)
+		VALUES
+		(TRUE, 5, 50, 5000000000, 5.5, 15.70, 222.33, 'eve', 'baz', 'elk',
+		 '\x42617a', '2025-01-01', '08:00:00', '08:00:00+00',
+		 '2025-01-01 08:00:00', '2025-01-01 08:00:00+00',
+		 '{"k":5}', '{"k":5}', 'e0eebc99-9c0b-4ef8-bb6d-6bb9bd380a55', '10.0.0.5',
+		 'bonus')`)
+		require.NoError(t, err)
+
+		assert.Eventually(t, func() bool {
+			return len(collector.Snapshot()) >= 5
+		}, 30*time.Second, 100*time.Millisecond)
+
+		fifth := collector.Snapshot()[4]
+
+		assert.Equal(t, "insert", fifth.Operation)
+		assert.NotEmpty(t, fifth.LSN)
+		assert.True(t, fifth.HasSchema, "post-ALTER CDC message must have schema metadata")
+
+		rawChildren, ok := fifth.Schema["children"]
+		require.True(t, ok, "post-ALTER schema must have children")
+		children := rawChildren.([]any)
+		assert.Len(t, children, 22, "post-ALTER schema should reflect the new column")
+
+		byName := make(map[string]string, len(children))
+		for _, c := range children {
+			child := c.(map[string]any)
+			byName[child["name"].(string)] = child["type"].(string)
+		}
+		assert.Equal(t, "STRING", byName["extra"], "new 'extra' column should have type STRING")
+	})
+
+	// The snapshot paths build the schema with columnTypesToSchema over
+	// sql.ColumnType, the stream with relationMessageToSchema over the
+	// pgoutput relation, so a backfilled row is worth comparing against a
+	// streamed one rather than merely checking the metadata is present.
+	t.Run("incremental snapshot rows carry the same schema as streamed rows", func(t *testing.T) {
+		const numPreExisting = 5
+		for range numPreExisting {
+			_, err := db.Exec(`INSERT INTO flights (name, created_at) VALUES ('pre', NOW())`)
+			require.NoError(t, err)
+		}
+
+		builder := service.NewStreamBuilder()
+		require.NoError(t, builder.AddInputYAML(fmt.Sprintf(`
+postgres_cdc:
+    dsn: %s
+    slot_name: test_slot_inc_schema_meta
+    schema: public
+    heartbeat_interval: 500ms
+    tables:
+      - flights
+    signal_table_name: rpcn_signal
+    incremental_snapshot:
+        enabled: true
+        chunk_size: 2
+        checkpoint_cache: snap_cache
+`, databaseURL)))
+		require.NoError(t, builder.AddCacheYAML(`
+label: snap_cache
+memory: {}`))
+
+		collector := &pgtest.SchemaMetadataCollector{}
+		require.NoError(t, builder.AddBatchConsumerFunc(collector.Consume))
+
+		// The signal row streams like any other insert, and its schema is
+		// the signal table's, not the one under test.
+		flightRows := func() []pgtest.CollectedMsg {
+			var out []pgtest.CollectedMsg
+			for _, m := range collector.Snapshot() {
+				if m.Table == "flights" {
+					out = append(out, m)
+				}
+			}
+			return out
+		}
+
+		stream, err := builder.Build()
+		require.NoError(t, err)
+		license.InjectTestService(stream.Resources())
+		go func() {
+			if err := stream.Run(t.Context()); err != nil && !errors.Is(err, context.Canceled) {
+				t.Error(err)
+			}
+		}()
+		t.Cleanup(func() { _ = stream.StopWithin(10 * time.Second) })
+
+		signalIncrementalSnapshot(t, db, "test_slot_inc_schema_meta", "flights")
+
+		countOps := func() (reads, inserts int) {
+			for _, m := range flightRows() {
+				switch m.Operation {
+				case "read":
+					reads++
+				case "insert":
+					inserts++
+				}
+			}
+			return reads, inserts
+		}
+
+		require.Eventually(t, func() bool {
+			reads, _ := countOps()
+			return reads >= numPreExisting
+		}, 60*time.Second, 100*time.Millisecond, "did not observe the backfilled rows")
+
+		// On the test goroutine, so a failure reports the real cause.
+		_, err = db.Exec(`INSERT INTO flights (name, created_at) VALUES ('live', NOW())`)
+		require.NoError(t, err)
+
+		require.Eventually(t, func() bool {
+			_, inserts := countOps()
+			return inserts >= 1
+		}, 60*time.Second, 100*time.Millisecond, "did not observe the streamed row")
+
+		var readSchema, insertSchema map[string]any
+		for _, m := range flightRows() {
+			require.True(t, m.HasSchema, "a %q message carried no schema metadata", m.Operation)
+			switch m.Operation {
+			case "read":
+				readSchema = m.Schema
+			case "insert":
+				insertSchema = m.Schema
+			}
+		}
+		require.NotNil(t, readSchema, "no backfilled row observed")
+		require.NotNil(t, insertSchema, "no streamed row observed")
+
+		assert.Equal(t, insertSchema, readSchema,
+			"a backfilled row's schema must match a streamed row's for the same table")
+		t.Logf("schema on a backfilled row: %v", readSchema)
+	})
+}
+
+// TestIntegrationPostgresDefaultBatchingIsOneRowPerMessage pins the default
+// shape of the stream: with no batching policy and batch_transactions off,
+// the rows of one transaction arrive downstream one message per batch, as
+// they did before the reader batched per transaction internally. Existing
+// pipelines rely on this, for example a fallback output that isolates one
+// bad row to a dead-letter queue.
+func TestIntegrationPostgresDefaultBatchingIsOneRowPerMessage(t *testing.T) {
+	integration.CheckSkip(t)
+	t.Parallel()
+	databaseURL, db, err := ResourceWithPostgreSQLVersion(t, "16")
+	require.NoError(t, err)
+
+	template := fmt.Sprintf(`
+postgres_cdc:
+    dsn: %s
+    slot_name: test_slot_default_batching
+    stream_snapshot: false
+    schema: public
+    tables:
+       - '"FlightsCompositePK"'
+`, databaseURL)
+
+	var (
+		sizesMut sync.Mutex
+		sizes    []int
+	)
+	streamOutBuilder := service.NewStreamBuilder()
+	require.NoError(t, streamOutBuilder.SetLoggerYAML(`level: OFF`))
+	require.NoError(t, streamOutBuilder.AddInputYAML(template))
+	require.NoError(t, streamOutBuilder.AddBatchConsumerFunc(func(_ context.Context, mb service.MessageBatch) error {
+		sizesMut.Lock()
+		defer sizesMut.Unlock()
+		sizes = append(sizes, len(mb))
+		return nil
+	}))
+	streamOut, err := streamOutBuilder.Build()
+	require.NoError(t, err)
+	license.InjectTestService(streamOut.Resources())
+	go func() {
+		if err := streamOut.Run(t.Context()); err != nil && !errors.Is(err, context.Canceled) {
+			t.Error(err)
+		}
+	}()
+
+	waitForActiveReplicationSlot(t, db, "test_slot_default_batching")
+
+	const rowCount = 5
+	tx, err := db.Begin()
+	require.NoError(t, err)
+	for i := range rowCount {
+		f := pgtest.GetFakeFlightRecord()
+		_, err = tx.Exec(`INSERT INTO "FlightsCompositePK" ("Seq", "Name", "CreatedAt") VALUES ($1, $2, $3);`, i, f.RealAddress.City, time.Unix(f.CreatedAt, 0).Format(time.RFC3339))
+		require.NoError(t, err)
+	}
+	require.NoError(t, tx.Commit())
+
+	assert.EventuallyWithT(t, func(c *assert.CollectT) {
+		sizesMut.Lock()
+		defer sizesMut.Unlock()
+		assert.Equal(c, []int{1, 1, 1, 1, 1}, sizes, "by default each row of a transaction is its own batch")
+	}, 25*time.Second, 100*time.Millisecond)
+
+	require.NoError(t, streamOut.StopWithin(10*time.Second))
+
+	sizesMut.Lock()
+	defer sizesMut.Unlock()
+	assert.Equal(t, []int{1, 1, 1, 1, 1}, sizes, "no extra batch should arrive after the stream is stopped")
+}
+
+// TestIntegrationPostgresBatchTransactions verifies that with
+// batch_transactions set and no batching policy, rows committed in one
+// transaction arrive downstream as a single output batch (the reader batches
+// per transaction and the input passes that batch straight through).
+func TestIntegrationPostgresBatchTransactions(t *testing.T) {
+	integration.CheckSkip(t)
+	t.Parallel()
+	databaseURL, db, err := ResourceWithPostgreSQLVersion(t, "16")
+	require.NoError(t, err)
+
+	template := fmt.Sprintf(`
+postgres_cdc:
+    dsn: %s
+    slot_name: test_slot_batch_transactions
+    stream_snapshot: false
+    schema: public
+    tables:
+       - '"FlightsCompositePK"'
+    batch_transactions: true
+`, databaseURL)
+
+	var (
+		sizesMut sync.Mutex
+		sizes    []int
+	)
+	streamOutBuilder := service.NewStreamBuilder()
+	require.NoError(t, streamOutBuilder.SetLoggerYAML(`level: OFF`))
+	require.NoError(t, streamOutBuilder.AddInputYAML(template))
+	require.NoError(t, streamOutBuilder.AddBatchConsumerFunc(func(_ context.Context, mb service.MessageBatch) error {
+		sizesMut.Lock()
+		defer sizesMut.Unlock()
+		sizes = append(sizes, len(mb))
+		return nil
+	}))
+	streamOut, err := streamOutBuilder.Build()
+	require.NoError(t, err)
+	license.InjectTestService(streamOut.Resources())
+	go func() {
+		if err := streamOut.Run(t.Context()); err != nil && !errors.Is(err, context.Canceled) {
+			t.Error(err)
+		}
+	}()
+
+	waitForActiveReplicationSlot(t, db, "test_slot_batch_transactions")
+
+	const rowCount = 5
+	tx, err := db.Begin()
+	require.NoError(t, err)
+	for i := range rowCount {
+		f := pgtest.GetFakeFlightRecord()
+		_, err = tx.Exec(`INSERT INTO "FlightsCompositePK" ("Seq", "Name", "CreatedAt") VALUES ($1, $2, $3);`, i, f.RealAddress.City, time.Unix(f.CreatedAt, 0).Format(time.RFC3339))
+		require.NoError(t, err)
+	}
+	require.NoError(t, tx.Commit())
+
+	assert.EventuallyWithT(t, func(c *assert.CollectT) {
+		sizesMut.Lock()
+		defer sizesMut.Unlock()
+		assert.Equal(c, []int{rowCount}, sizes, "one transaction should arrive as one batch")
+	}, 25*time.Second, 100*time.Millisecond)
+
+	require.NoError(t, streamOut.StopWithin(10*time.Second))
+
+	sizesMut.Lock()
+	defer sizesMut.Unlock()
+	assert.Equal(t, []int{rowCount}, sizes, "no extra batch should arrive after the stream is stopped")
+}
+
+// TestIntegrationPostgresBatchingCountHonoured verifies that a configured
+// batching.count is honoured exactly even when the reader delivers a whole
+// transaction at once: 9 rows in one transaction with count 3 must arrive as
+// three batches of three.
+func TestIntegrationPostgresBatchingCountHonoured(t *testing.T) {
+	integration.CheckSkip(t)
+	t.Parallel()
+	databaseURL, db, err := ResourceWithPostgreSQLVersion(t, "16")
+	require.NoError(t, err)
+
+	template := fmt.Sprintf(`
+postgres_cdc:
+    dsn: %s
+    slot_name: test_slot_batching_count
+    stream_snapshot: false
+    schema: public
+    tables:
+       - '"FlightsCompositePK"'
+    batching:
+      count: 3
+      period: 1h
+`, databaseURL)
+
+	var (
+		sizesMut sync.Mutex
+		sizes    []int
+	)
+	streamOutBuilder := service.NewStreamBuilder()
+	require.NoError(t, streamOutBuilder.SetLoggerYAML(`level: OFF`))
+	require.NoError(t, streamOutBuilder.AddInputYAML(template))
+	require.NoError(t, streamOutBuilder.AddBatchConsumerFunc(func(_ context.Context, mb service.MessageBatch) error {
+		sizesMut.Lock()
+		defer sizesMut.Unlock()
+		sizes = append(sizes, len(mb))
+		return nil
+	}))
+	streamOut, err := streamOutBuilder.Build()
+	require.NoError(t, err)
+	license.InjectTestService(streamOut.Resources())
+	go func() {
+		if err := streamOut.Run(t.Context()); err != nil && !errors.Is(err, context.Canceled) {
+			t.Error(err)
+		}
+	}()
+
+	waitForActiveReplicationSlot(t, db, "test_slot_batching_count")
+
+	const rowCount = 9
+	tx, err := db.Begin()
+	require.NoError(t, err)
+	for i := range rowCount {
+		f := pgtest.GetFakeFlightRecord()
+		_, err = tx.Exec(`INSERT INTO "FlightsCompositePK" ("Seq", "Name", "CreatedAt") VALUES ($1, $2, $3);`, i, f.RealAddress.City, time.Unix(f.CreatedAt, 0).Format(time.RFC3339))
+		require.NoError(t, err)
+	}
+	require.NoError(t, tx.Commit())
+
+	assert.EventuallyWithT(t, func(c *assert.CollectT) {
+		sizesMut.Lock()
+		defer sizesMut.Unlock()
+		assert.Equal(c, []int{3, 3, 3}, sizes, "count 3 must split one 9-row transaction into three batches")
+	}, 25*time.Second, 100*time.Millisecond)
+
+	require.NoError(t, streamOut.StopWithin(10*time.Second))
+
+	sizesMut.Lock()
+	defer sizesMut.Unlock()
+	assert.Equal(t, []int{3, 3, 3}, sizes, "no extra batch should arrive after the stream is stopped")
+}
+
+// TestIntegrationPostgresLargeTransactionSpansBatches covers the reader's row
+// cap under batch_transactions: a single transaction larger than the
+// streaming cap (half the default checkpoint_limit of 1024, i.e. 512 rows)
+// must arrive as several batches with no rows lost, and a restart on the same
+// slot after everything was acked must not replay any of them.
+func TestIntegrationPostgresLargeTransactionSpansBatches(t *testing.T) {
+	integration.CheckSkip(t)
+	t.Parallel()
+	databaseURL, db, err := ResourceWithPostgreSQLVersion(t, "16")
+	require.NoError(t, err)
+
+	template := fmt.Sprintf(`
+postgres_cdc:
+    dsn: %s
+    slot_name: test_slot_large_txn
+    stream_snapshot: false
+    schema: public
+    tables:
+       - '"FlightsCompositePK"'
+    batch_transactions: true
+`, databaseURL)
+
+	var (
+		mut   sync.Mutex
+		sizes []int
+		seqs  = map[int64]int{}
+	)
+	record := func(mb service.MessageBatch) error {
+		mut.Lock()
+		defer mut.Unlock()
+		sizes = append(sizes, len(mb))
+		for _, m := range mb {
+			var row struct {
+				Seq int64 `json:"Seq"`
+			}
+			b, err := m.AsBytes()
+			if err != nil {
+				return err
+			}
+			if err := json.Unmarshal(b, &row); err != nil {
+				return err
+			}
+			seqs[row.Seq]++
+		}
+		return nil
+	}
+
+	build := func() *service.Stream {
+		sb := service.NewStreamBuilder()
+		require.NoError(t, sb.SetLoggerYAML(`level: OFF`))
+		require.NoError(t, sb.AddInputYAML(template))
+		require.NoError(t, sb.AddBatchConsumerFunc(func(_ context.Context, mb service.MessageBatch) error { return record(mb) }))
+		s, err := sb.Build()
+		require.NoError(t, err)
+		license.InjectTestService(s.Resources())
+		return s
+	}
+
+	run1 := build()
+	go func() {
+		if err := run1.Run(t.Context()); err != nil && !errors.Is(err, context.Canceled) {
+			t.Error(err)
+		}
+	}()
+	waitForActiveReplicationSlot(t, db, "test_slot_large_txn")
+
+	const rowCount = 1500
+	tx, err := db.Begin()
+	require.NoError(t, err)
+	for i := range rowCount {
+		f := pgtest.GetFakeFlightRecord()
+		_, err = tx.Exec(`INSERT INTO "FlightsCompositePK" ("Seq", "Name", "CreatedAt") VALUES ($1, $2, $3);`, i, f.RealAddress.City, time.Unix(f.CreatedAt, 0).Format(time.RFC3339))
+		require.NoError(t, err)
+	}
+	require.NoError(t, tx.Commit())
+
+	assert.EventuallyWithT(t, func(c *assert.CollectT) {
+		mut.Lock()
+		defer mut.Unlock()
+		assert.Equal(c, []int{512, 512, 476}, sizes, "a 1500-row transaction must split at the 512-row cap derived from the default checkpoint_limit")
+		assert.Len(c, seqs, rowCount)
+	}, 60*time.Second, 200*time.Millisecond)
+	require.NoError(t, run1.StopWithin(10*time.Second))
+
+	// Restart on the same slot: nothing already acked may be replayed, and
+	// new rows must still arrive.
+	mut.Lock()
+	sizes = nil
+	mut.Unlock()
+	run2 := build()
+	go func() {
+		if err := run2.Run(t.Context()); err != nil && !errors.Is(err, context.Canceled) {
+			t.Error(err)
+		}
+	}()
+	// The slot already exists from the first run; wait for the second run
+	// to be streaming from it.
+	waitForActiveReplicationSlot(t, db, "test_slot_large_txn")
+
+	for i := rowCount; i < rowCount+3; i++ {
+		f := pgtest.GetFakeFlightRecord()
+		_, err = db.Exec(`INSERT INTO "FlightsCompositePK" ("Seq", "Name", "CreatedAt") VALUES ($1, $2, $3);`, i, f.RealAddress.City, time.Unix(f.CreatedAt, 0).Format(time.RFC3339))
+		require.NoError(t, err)
+	}
+	assert.EventuallyWithT(t, func(c *assert.CollectT) {
+		mut.Lock()
+		defer mut.Unlock()
+		assert.Equal(c, []int{1, 1, 1}, sizes, "only the three new single-row transactions may arrive after restart")
+	}, 30*time.Second, 200*time.Millisecond)
+	require.NoError(t, run2.StopWithin(10*time.Second))
+
+	mut.Lock()
+	defer mut.Unlock()
+	require.Len(t, seqs, rowCount+3)
+	for seq, n := range seqs {
+		require.Equal(t, 1, n, "seq %d delivered %d times", seq, n)
+	}
+}
+
+// waitForActiveReplicationSlot blocks until slot exists and a walsender is
+// streaming from it, so a row written afterwards is decoded. A fixed sleep is
+// flaky on loaded runners: the slot is created on a goroutine after the
+// stream starts, and a transaction committed before that is never seen.
+func waitForActiveReplicationSlot(t *testing.T, db interface {
+	QueryRow(query string, args ...any) *sql.Row
+}, slot string,
+) {
+	t.Helper()
+	require.Eventually(t, func() bool {
+		var active bool
+		return db.QueryRow("SELECT active FROM pg_replication_slots WHERE slot_name = $1", slot).Scan(&active) == nil && active
+	}, 30*time.Second, 250*time.Millisecond, "replication slot %s never became active", slot)
+}

@@ -1,0 +1,535 @@
+// Copyright 2024 Redpanda Data, Inc.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//    http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package ollama
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"slices"
+	"unicode/utf8"
+
+	"github.com/Jeffail/gabs/v2"
+
+	"github.com/redpanda-data/benthos/v4/public/bloblang"
+	"github.com/redpanda-data/benthos/v4/public/service"
+
+	"github.com/redpanda-data/connect/v4/internal/llm"
+)
+
+const (
+	ocpFieldUserPrompt     = "prompt"
+	ocpFieldSystemPrompt   = "system_prompt"
+	ocpFieldResponseFormat = "response_format"
+	ocpFieldImage          = "image"
+	// Prediction options
+	ocpFieldMaxTokens          = "max_tokens"
+	ocpFieldNumKeep            = "num_keep"
+	ocpFieldSeed               = "seed"
+	ocpFieldTopK               = "top_k"
+	ocpFieldTopP               = "top_p"
+	ocpFieldTemp               = "temperature"
+	ocpFieldRepeatPenalty      = "repeat_penalty"
+	ocpFieldPresencePenalty    = "presence_penalty"
+	ocpFieldFrequencyPenalty   = "frequency_penalty"
+	ocpFieldStop               = "stop"
+	ocpFieldEmitPromptMetadata = "save_prompt_metadata"
+	ocpFieldHistory            = "history"
+	ocpFieldMaxToolCalls       = "max_tool_calls"
+
+	// Tool options
+	ocpFieldTool                     = "tools"
+	ocpToolFieldName                 = "name"
+	ocpToolFieldDesc                 = "description"
+	ocpToolFieldParams               = "parameters"
+	ocpToolParamFieldRequired        = "required"
+	ocpToolParamFieldProps           = "properties"
+	ocpToolParamPropFieldType        = "type"
+	ocpToolParamPropFieldDescription = "description"
+	ocpToolParamPropFieldEnum        = "enum"
+	ocpToolFieldPipeline             = "processors"
+)
+
+func init() {
+	service.MustRegisterProcessor(
+		"ollama_chat",
+		ollamaChatProcessorConfig(),
+		makeOllamaCompletionProcessor,
+	)
+}
+
+func ollamaChatProcessorConfig() *service.ConfigSpec {
+	return service.NewConfigSpec().
+		Categories("AI").
+		Summary("Generates responses to messages in a chat conversation, using the Ollama API.").
+		Description(`This processor sends prompts to your chosen Ollama large language model (LLM) and generates text from the responses, using the Ollama API. The model can also call external tools that you define in the `+"<<tools,`tools`>>"+` field to retrieve more information to answer a prompt.
+
+By default, the processor starts and runs a locally installed Ollama server. Alternatively, to use an already running Ollama server, add your server details to the `+"`"+bopFieldServerAddress+"`"+` field. You can https://ollama.com/download[download and install Ollama from the Ollama website^].
+
+For more information, see the https://github.com/ollama/ollama/tree/main/docs[Ollama documentation^] and <<examples,Examples>>.`).
+		Version("4.32.0").
+		Fields(
+			modelField("llama3.1", "gemma2", "qwen2", "phi3"),
+			llm.PromptField(ocpFieldUserPrompt).
+				Optional(),
+			llm.SystemPromptField(ocpFieldSystemPrompt).
+				Advanced().
+				Optional(),
+			service.NewBloblangField(ocpFieldImage).
+				Description("An optional image to submit along with the `prompt` value. The result should be a byte array.").
+				Version("4.38.0").
+				Optional().
+				Example(`root = this.image.decode("base64") # decode base64 encoded image`),
+			service.NewStringEnumField(ocpFieldResponseFormat, "text", "json").
+				Description("The format of the response the Ollama model generates. If specifying JSON output, then the `"+ocpFieldUserPrompt+"` should specify that the output should be in JSON as well.").Version("4.34.0").
+				Default("text"),
+			service.NewIntField(ocpFieldMaxTokens).
+				Optional().
+				Description("The maximum number of tokens to predict and output. Limiting the amount of output means that requests are processed faster and have a fixed limit on the cost.").Version("4.34.0").
+				ShortDescription("The maximum number of tokens to predict and output."),
+			service.NewIntField(ocpFieldTemp).
+				Optional().
+				Description("The temperature of the model. Increasing the temperature makes the model answer more creatively.").Version("4.34.0").
+				LintRule(`root = if this > 2 || this < 0 { [ "field must be between 0.0 and 2.0" ] }`),
+			service.NewIntField(ocpFieldNumKeep).
+				Optional().
+				Advanced().
+				Description("Specify the number of tokens from the initial prompt to retain when the model resets its internal context. By default, this value is set to `4`. Use `-1` to retain all tokens from the initial prompt.").Version("4.34.0").
+				ShortDescription("Tokens from the initial prompt to retain when the model resets its context. Use -1 to keep all."),
+			service.NewIntField(ocpFieldSeed).
+				Optional().
+				Advanced().
+				Description("Sets the random number seed to use for generation. Setting this to a specific number will make the model generate the same text for the same prompt.").Version("4.34.0").
+				ShortDescription("The random number seed for generation. A fixed seed makes the same prompt produce the same text.").
+				Example(42),
+			service.NewIntField(ocpFieldTopK).
+				Optional().
+				Advanced().
+				Description("Reduces the probability of generating nonsense. A higher value, for example `100`, will give more diverse answers. A lower value, for example `10`, will be more conservative.").Version("4.34.0").
+				ShortDescription("Reduces the probability of nonsense. Higher values give more diverse answers."),
+			service.NewFloatField(ocpFieldTopP).
+				Optional().
+				Advanced().
+				Description("Works together with `top-k`. A higher value, for example 0.95, will lead to more diverse text. A lower value, for example 0.5, will generate more focused and conservative text.").Version("4.34.0").
+				ShortDescription("Works with top_k. Higher values give more diverse text, lower values more focused text.").
+				LintRule(`root = if this > 1 || this < 0 { [ "field must be between 0.0 and 1.0" ] }`),
+			service.NewFloatField(ocpFieldRepeatPenalty).
+				Optional().
+				Advanced().
+				Description(`Sets how strongly to penalize repetitions. A higher value, for example 1.5, will penalize repetitions more strongly. A lower value, for example 0.9, will be more lenient.`).Version("4.34.0").
+				ShortDescription("How strongly to penalise repetition. Higher values penalise more strongly.").
+				LintRule(`root = if this > 2 || this < -2 { [ "field must be between -2.0 and 2.0" ] }`),
+			service.NewFloatField(ocpFieldPresencePenalty).
+				Optional().
+				Advanced().
+				Description("A number between `-2.0` and `2.0` that the processor sends to the Ollama server as the `presence_penalty` model option. Positive values penalize every token that has already appeared in the text, regardless of how often, which makes the model more likely to move on to new topics. A value of `0` is not sent, so the server's default applies.").Version("4.34.0").
+				ShortDescription("Between -2.0 and 2.0. Positive values penalise tokens that already appear, encouraging new topics.").
+				LintRule(`root = if this > 2 || this < -2 { [ "field must be between -2.0 and 2.0" ] }`),
+			service.NewFloatField(ocpFieldFrequencyPenalty).
+				Optional().
+				Advanced().
+				Description("A number between `-2.0` and `2.0` that the processor sends to the Ollama server as the `frequency_penalty` model option. Positive values penalize each token in proportion to how often it has already appeared in the text, which makes the model less likely to repeat the same line verbatim. A value of `0` is not sent, so the server's default applies.").Version("4.34.0").
+				ShortDescription("Between -2.0 and 2.0. Positive values penalise tokens by how often they already appear, reducing verbatim repetition.").
+				LintRule(`root = if this > 2 || this < -2 { [ "field must be between -2.0 and 2.0" ] }`),
+			service.NewStringListField(ocpFieldStop).
+				Optional().
+				Advanced().
+				Description(`Sets the stop sequences to use. When this pattern is encountered, the LLM stops generating text and returns the final response.`).Version("4.34.0").
+				ShortDescription("Stop sequences. When one is encountered the LLM stops generating and returns its response."),
+			service.NewBoolField(ocpFieldEmitPromptMetadata).
+				Default(false).
+				Description(`Set to `+"`"+`true`+"`"+` to save the prompt value to a metadata field (`+"`"+`@prompt`+"`"+`) on the corresponding output message. If you use the `+"`"+`system_prompt`+"`"+` field, its value is also saved to an `+"`"+`@system_prompt`+"`"+` metadata field on each output message.`).Version("4.42.0").
+				ShortDescription("Save the prompt as @prompt metadata on the output message, and system_prompt as @system_prompt."),
+			service.NewBloblangField(ocpFieldHistory).
+				Optional().
+				Description(`Include historical messages in a chat request. You must use a Bloblang query to create an array of objects in the form of `+"`"+`[{"role": "", "content":""}]`+"`"+` where:
+
+- `+"`"+`role`+"`"+` is the sender of the original messages, either `+"`"+`system`+"`"+`, `+"`"+`user`+"`"+`, `+"`"+`assistant`+"`"+`, or `+"`"+`tool`+"`"+`.
+- `+"`"+`content`+"`"+` is the text of the original messages.`).Version("4.51.0").
+				ShortDescription("Historical messages to include in the chat request, as an array of role and content objects."),
+			service.NewIntField(ocpFieldMaxToolCalls).
+				Default(3).
+				Advanced().
+				Description(`The maximum number of sequential calls you can make to external tools to retrieve additional information to answer a prompt.`).Version("4.45.0").
+				LintRule(`root = if this <= 0 { ["field must be greater than zero"] }`),
+			service.NewObjectListField(
+				ocpFieldTool,
+				llm.ToolFields(llm.ToolParametersField())...,
+			).Description("The external tools the LLM can invoke, such as functions, APIs, or web browsing. You can build subpipelines of processors that include definitions of these tools, and the specified LLM can choose when to invoke them to help answer a prompt.").Version("4.45.0").
+				ShortDescription("The tools the LLM may invoke, allowing subpipelines to be called for agentic actions.").
+				Default([]any{}),
+		).Fields(commonFields()...).
+		Example(
+			"Use Llava to analyze an image",
+			"This example fetches image URLs from stdin and has a multimodal LLM describe the image.",
+			`
+input:
+  stdin:
+    scanner:
+      lines: {}
+pipeline:
+  processors:
+    - http:
+        verb: GET
+        url: "${!content().string()}"
+    - ollama_chat:
+        model: llava
+        prompt: "Describe the following image"
+        image: "root = content()"
+output:
+  stdout:
+    codec: lines
+`).
+		Example(
+			"Use subpipelines as tool calls",
+			"This example allows llama3.2 to execute a subpipeline as a tool call to get more data.",
+			`
+input:
+  generate:
+    count: 1
+    mapping: |
+      root = "What is the weather like in Chicago?"
+pipeline:
+  processors:
+    - ollama_chat:
+        model: llama3.2
+        prompt: "${!content().string()}"
+        tools:
+          - name: GetWeather
+            description: "Retrieve the weather for a specific city"
+            parameters:
+              required: ["city"]
+              properties:
+                city:
+                  type: string
+                  description: the city to lookup the weather for
+            processors:
+              - http:
+                  verb: GET
+                  url: 'https://wttr.in/${!this.city}?T'
+                  headers:
+                    # Spoof curl user-ageent to get a plaintext text
+                    User-Agent: curl/8.11.1
+output:
+  stdout: {}
+`)
+}
+
+func makeOllamaCompletionProcessor(conf *service.ParsedConfig, mgr *service.Resources) (service.Processor, error) {
+	p := ollamaCompletionProcessor{}
+	if conf.Contains(ocpFieldUserPrompt) {
+		pf, err := conf.FieldInterpolatedString(ocpFieldUserPrompt)
+		if err != nil {
+			return nil, err
+		}
+		p.userPrompt = pf
+	}
+	if conf.Contains(ocpFieldSystemPrompt) {
+		pf, err := conf.FieldInterpolatedString(ocpFieldSystemPrompt)
+		if err != nil {
+			return nil, err
+		}
+		p.systemPrompt = pf
+	}
+	if conf.Contains(ocpFieldHistory) {
+		i, err := conf.FieldBloblang(ocpFieldHistory)
+		if err != nil {
+			return nil, err
+		}
+		p.history = i
+	}
+	if conf.Contains(ocpFieldImage) {
+		i, err := conf.FieldBloblang(ocpFieldImage)
+		if err != nil {
+			return nil, err
+		}
+		p.image = i
+	}
+	format, err := conf.FieldString(ocpFieldResponseFormat)
+	if err != nil {
+		return nil, err
+	}
+	switch format {
+	case "json":
+		p.format = json.RawMessage(`"json"`)
+	case "text":
+		p.format = nil
+	default:
+		return nil, fmt.Errorf("invalid %s: %q", ocpFieldResponseFormat, format)
+	}
+	p.savePrompt, err = conf.FieldBool(ocpFieldEmitPromptMetadata)
+	if err != nil {
+		return nil, err
+	}
+	p.maxToolCalls, err = conf.FieldInt(ocpFieldMaxToolCalls)
+	if err != nil {
+		return nil, err
+	}
+	if conf.Contains(ocpFieldTool) {
+		tools, err := conf.FieldObjectList(ocpFieldTool)
+		if err != nil {
+			return nil, err
+		}
+		for _, toolConf := range tools {
+			t := Tool{Type: "function"}
+			t.Function.Name, err = toolConf.FieldString(ocpToolFieldName)
+			if err != nil {
+				return nil, err
+			}
+			t.Function.Description, err = toolConf.FieldString(ocpToolFieldDesc)
+			if err != nil {
+				return nil, err
+			}
+			t.Function.Parameters.Type = "object"
+			paramsConf := toolConf.Namespace(ocpToolFieldParams)
+			t.Function.Parameters.Required, err = paramsConf.FieldStringList(ocpToolParamFieldRequired)
+			if err != nil {
+				return nil, err
+			}
+			propsConf, err := paramsConf.FieldObjectMap(ocpToolParamFieldProps)
+			if err != nil {
+				return nil, err
+			}
+			t.Function.Parameters.Properties = map[string]ToolProperty{}
+			for name, paramConf := range propsConf {
+				paramType, err := paramConf.FieldString(ocpToolParamPropFieldType)
+				if err != nil {
+					return nil, err
+				}
+				desc, err := paramConf.FieldString(ocpToolParamPropFieldDescription)
+				if err != nil {
+					return nil, err
+				}
+				enumStr, err := paramConf.FieldStringList(ocpToolParamPropFieldEnum)
+				if err != nil {
+					return nil, err
+				}
+				var enum []any
+				for _, e := range enumStr {
+					enum = append(enum, e)
+				}
+				t.Function.Parameters.Properties[name] = ToolProperty{
+					Type:        PropertyType{paramType},
+					Description: desc,
+					Enum:        enum,
+				}
+			}
+
+			pipeline, err := toolConf.FieldProcessorList(ocpToolFieldPipeline)
+			if err != nil {
+				return nil, err
+			}
+			p.tools = append(p.tools, tool{t, pipeline})
+		}
+	}
+	b, err := newBaseProcessor(conf, mgr)
+	if err != nil {
+		return nil, err
+	}
+	p.baseOllamaProcessor = b
+	return &p, nil
+}
+
+type tool struct {
+	spec     Tool
+	pipeline []*service.OwnedProcessor
+}
+
+type ollamaCompletionProcessor struct {
+	*baseOllamaProcessor
+
+	format       json.RawMessage
+	userPrompt   *service.InterpolatedString
+	systemPrompt *service.InterpolatedString
+	history      *bloblang.Executor
+	image        *bloblang.Executor
+	savePrompt   bool
+	maxToolCalls int
+	tools        []tool
+}
+
+func (o *ollamaCompletionProcessor) Process(ctx context.Context, msg *service.Message) (service.MessageBatch, error) {
+	var sp string
+	if o.systemPrompt != nil {
+		p, err := o.systemPrompt.TryString(msg)
+		if err != nil {
+			return nil, err
+		}
+		sp = p
+	}
+	up, err := o.computePrompt(msg)
+	if err != nil {
+		return nil, err
+	}
+	var image []byte
+	if o.image != nil {
+		o, err := msg.BloblangQuery(o.image)
+		if err != nil {
+			return nil, fmt.Errorf("unable to execute bloblang for `%s`: %w", ocpFieldImage, err)
+		}
+		image, err = o.AsBytes()
+		if err != nil {
+			return nil, fmt.Errorf("unable to convert `%s` result to a byte array: %w", ocpFieldImage, err)
+		}
+	}
+	var history []Message
+	if o.history != nil {
+		h, err := msg.BloblangQuery(o.history)
+		if err != nil {
+			return nil, fmt.Errorf("unable to execute bloblang for `%s`: %w", ocpFieldHistory, err)
+		}
+		b, err := h.AsBytes()
+		if err != nil {
+			return nil, fmt.Errorf("unable to convert `%s` result to bytes: %w", ocpFieldHistory, err)
+		}
+		if err := json.Unmarshal(b, &history); err != nil {
+			return nil, fmt.Errorf("unable to parse `%s`: %w", ocpFieldHistory, err)
+		}
+	}
+	g, err := o.generateCompletion(ctx, sp, up, image, history)
+	if err != nil {
+		return nil, err
+	}
+	m := msg.Copy()
+	m.SetBytes([]byte(g))
+	if o.savePrompt {
+		if sp != "" {
+			m.MetaSet("system_prompt", sp)
+		}
+		m.MetaSet("prompt", up)
+	}
+	return service.MessageBatch{m}, nil
+}
+
+func (o *ollamaCompletionProcessor) computePrompt(msg *service.Message) (string, error) {
+	if o.userPrompt != nil {
+		return o.userPrompt.TryString(msg)
+	}
+	b, err := msg.AsBytes()
+	if err != nil {
+		return "", err
+	}
+	if !utf8.Valid(b) {
+		return "", errors.New("message payload contained invalid UTF8")
+	}
+	return string(b), nil
+}
+
+func (o *ollamaCompletionProcessor) generateCompletion(ctx context.Context, systemPrompt, userPrompt string, image []byte, history []Message) (string, error) {
+	var req ChatRequest
+	req.Model = o.model
+	req.Options = o.opts
+	req.Messages = history
+	if o.format != nil {
+		req.Format = o.format
+	}
+	if systemPrompt != "" {
+		req.Messages = append(req.Messages, Message{
+			Role:    "system",
+			Content: systemPrompt,
+		})
+	}
+	var images []ImageData
+	if image != nil {
+		images = []ImageData{image}
+	}
+	req.Messages = append(req.Messages, Message{
+		Role:    "user",
+		Content: userPrompt,
+		Images:  images,
+	})
+	shouldStream := false
+	req.Stream = &shouldStream
+	for _, t := range o.tools {
+		req.Tools = append(req.Tools, t.spec)
+	}
+	// Allow up to N iterations of calling tools
+	for range o.maxToolCalls + 1 {
+		var resp ChatResponse
+		o.logger.Tracef("making LLM chat request messages: %s", gabs.Wrap(req.Messages).EncodeJSON())
+		err := o.client.Chat(ctx, &req, func(r ChatResponse) error {
+			resp = r
+			return nil
+		})
+		if err != nil {
+			return "", err
+		}
+		if len(resp.Message.ToolCalls) == 0 {
+			return resp.Message.Content, nil
+		}
+		req.Messages = append(req.Messages, resp.Message)
+		for _, toolCall := range resp.Message.ToolCalls {
+			o.logger.Debugf("LLM requested tool %s with arguments: %s", toolCall.Function.Name, toolCall.Function.Arguments.String())
+			idx := slices.IndexFunc(o.tools, func(t tool) bool { return t.spec.Function.Name == toolCall.Function.Name })
+			if idx < 0 {
+				return "", fmt.Errorf("unknown tool call requested: %s", toolCall.Function.Name)
+			}
+			pipeline := o.tools[idx].pipeline
+			msg := service.NewMessage(nil)
+			msg.SetStructuredMut(map[string]any(toolCall.Function.Arguments))
+			output, err := service.ExecuteProcessors(ctx, pipeline, service.MessageBatch{msg})
+			if err != nil {
+				return "", fmt.Errorf("error calling tool %s: %w", toolCall.Function.Name, err)
+			}
+			resp, err := combineToSingleMessage(output)
+			if err != nil {
+				return "", fmt.Errorf("error processing pipeline %s output: %w", toolCall.Function.Name, err)
+			}
+			o.logger.Debugf("Tool %s response: %s", toolCall.Function.Name, resp)
+			req.Messages = append(req.Messages, Message{Role: "tool", Content: resp})
+		}
+	}
+	return "", fmt.Errorf("model did not finish after %d function calls", o.maxToolCalls)
+}
+
+func combineToSingleMessage(batches []service.MessageBatch) (string, error) {
+	msgs := []any{}
+	for _, batch := range batches {
+		for _, msg := range batch {
+			if err := msg.GetError(); err != nil {
+				return "", fmt.Errorf("pipeline resulted in message with error: %w", err)
+			}
+			if msg.HasStructured() {
+				v, err := msg.AsStructured()
+				if err != nil {
+					return "", fmt.Errorf("unable to extract JSON result: %w", err)
+				}
+				msgs = append(msgs, v)
+			} else {
+				b, err := msg.AsBytes()
+				if err != nil {
+					return "", fmt.Errorf("unable to extract raw bytes result: %w", err)
+				}
+				msgs = append(msgs, string(b))
+			}
+		}
+	}
+	if len(msgs) == 1 {
+		return bloblang.ValueToString(msgs[0]), nil
+	}
+	return bloblang.ValueToString(msgs), nil
+}
+
+func (o *ollamaCompletionProcessor) Close(ctx context.Context) error {
+	for _, tool := range o.tools {
+		for _, processor := range tool.pipeline {
+			if err := processor.Close(ctx); err != nil {
+				return err
+			}
+		}
+	}
+	return o.baseOllamaProcessor.Close(ctx)
+}

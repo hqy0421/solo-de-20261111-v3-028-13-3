@@ -1,0 +1,71 @@
+// Copyright 2024 Redpanda Data, Inc.
+//
+// Licensed as a Redpanda Enterprise file under the Redpanda Community
+// License (the "License"); you may not use this file except in compliance with
+// the License. You may obtain a copy of the License at
+//
+// https://github.com/redpanda-data/connect/v4/blob/main/licenses/rcl.md
+
+package pglogicalstream
+
+import "time"
+
+// StreamMode represents the mode of the stream at the time of the message
+type StreamMode string
+
+const (
+	// StreamModeStreaming indicates that the stream is in streaming mode
+	StreamModeStreaming StreamMode = "streaming"
+	// StreamModeSnapshot indicates that the stream is in snapshot mode
+	StreamModeSnapshot StreamMode = "snapshot"
+)
+
+// OpType is the type of operation from the database
+type OpType string
+
+const (
+	// ReadOpType is a snapshot read
+	ReadOpType OpType = "read"
+	// InsertOpType is a database insert
+	InsertOpType OpType = "insert"
+	// UpdateOpType is a database update
+	UpdateOpType OpType = "update"
+	// DeleteOpType is a database delete
+	DeleteOpType OpType = "delete"
+	// BeginOpType is a database transaction begin
+	BeginOpType OpType = "begin"
+	// CommitOpType is a database transaction commit
+	CommitOpType OpType = "commit"
+	// SnapshotCompleteOpType is an internal sentinel emitted after all snapshot
+	// rows have been sent. It signals the input layer to block promotion of the
+	// replication slot until every snapshot message has been acknowledged
+	// downstream; it is never forwarded downstream.
+	SnapshotCompleteOpType OpType = "snapshot_complete"
+	// IncrementalSnapshotCheckpointOpType is an internal sentinel carrying
+	// only an incremental snapshot checkpoint (IncrementalSnapshotState) when
+	// state advanced without emitting rows.
+	IncrementalSnapshotCheckpointOpType OpType = "incremental_snapshot_checkpoint"
+)
+
+// StreamMessage represents a single change from the database
+type StreamMessage struct {
+	LSN       *string `json:"lsn"`
+	Operation OpType  `json:"operation"`
+	Schema    string  `json:"schema"`
+	Table     string  `json:"table"`
+	// For deleted messages - there will be old changes if replica identity set to full or empty changes
+	Data any `json:"data"`
+	// ColumnSchema contains the table's column schema in benthos common schema format.
+	// It is set as message metadata and excluded from JSON serialization.
+	ColumnSchema             any       `json:"-"`
+	CommitTime               time.Time `json:"-"`
+	BeforeData               any       `json:"-"`
+	IncrementalSnapshotState []byte    `json:"-"`
+	// AckLSN is the position the consumer acknowledges to Postgres once this
+	// message is processed: the row's own LSN, or the LSN of the commit record
+	// when this row is the last of its transaction. Confirming a row LSN below
+	// its commit makes Postgres replay the whole transaction on restart, so the
+	// reader stamps the commit here when it flushes a batch at a transaction
+	// boundary. Nil for snapshot rows, which carry no position.
+	AckLSN *string `json:"-"`
+}

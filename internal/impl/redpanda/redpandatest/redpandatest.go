@@ -1,0 +1,131 @@
+// Copyright 2025 Redpanda Data, Inc.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package redpandatest
+
+import (
+	"context"
+	"testing"
+
+	"github.com/testcontainers/testcontainers-go"
+	tcredpanda "github.com/testcontainers/testcontainers-go/modules/redpanda"
+)
+
+// Endpoints contains the endpoints for the Redpanda container.
+type Endpoints struct {
+	BrokerAddr        string
+	SchemaRegistryURL string
+}
+
+// Config contains configuration for starting a Redpanda broker.
+type Config struct {
+	// Nightly uses the nightly Redpanda image instead of the latest stable image.
+	Nightly bool
+	// AutoCreateTopics enables automatic topic creation.
+	AutoCreateTopics bool
+	// ExtraOpts are additional testcontainers options applied after the default ones.
+	ExtraOpts []testcontainers.ContainerCustomizer
+}
+
+// WithLowAIOUsage lowers the Linux AIO events that one Redpanda container
+// reserves at startup, from about 11000 to about 2000. The AIO events are
+// shared by all containers on the Docker host, and the default limit
+// (fs.aio-max-nr) is 65536. With the Redpanda default, a test package can
+// start only about 5 containers at the same time. More containers exit with
+// code 133. With this option, tests that start their own containers can run
+// in parallel.
+func WithLowAIOUsage() testcontainers.ContainerCustomizer {
+	return testcontainers.WithCmdArgs("--max-networking-io-control-blocks=1000")
+}
+
+// DefaultConfig returns the default configuration for starting a Redpanda broker.
+var DefaultConfig = Config{
+	AutoCreateTopics: true,
+}
+
+// StartSingleBroker starts a single Redpanda broker with default configuration.
+// It exposes the broker port and enables auto-create topics by default.
+func StartSingleBroker(t *testing.T) (Endpoints, testcontainers.Container, error) {
+	t.Helper()
+	return StartSingleBrokerWithConfig(t, DefaultConfig)
+}
+
+// StartSingleBrokerWithConfig starts a single Redpanda broker with custom configuration.
+func StartSingleBrokerWithConfig(t *testing.T, cfg Config) (Endpoints, testcontainers.Container, error) {
+	t.Helper()
+
+	img := "docker.redpanda.com/redpandadata/redpanda:latest"
+	if cfg.Nightly {
+		img = "docker.redpanda.com/redpandadata/redpanda-nightly:latest"
+	}
+
+	opts := []testcontainers.ContainerCustomizer{WithLowAIOUsage()}
+	if cfg.AutoCreateTopics {
+		opts = append(opts, tcredpanda.WithAutoCreateTopics())
+	}
+	opts = append(opts, cfg.ExtraOpts...)
+
+	// The Redpanda testcontainers module applies a fixed 60s readiness timeout
+	// per wait strategy. Under Docker pressure the broker can take longer to
+	// come up, so retry a few times before giving up.
+	const maxAttempts = 3
+	var (
+		ctr *tcredpanda.Container
+		err error
+	)
+	for attempt := 1; attempt <= maxAttempts; attempt++ {
+		ctr, err = tcredpanda.Run(t.Context(), img, opts...)
+		if err == nil {
+			break
+		}
+		t.Logf("redpanda container start attempt %d/%d failed: %v", attempt, maxAttempts, err)
+		if ctr != nil {
+			_ = ctr.Terminate(context.Background())
+			ctr = nil
+		}
+	}
+	testcontainers.CleanupContainer(t, ctr)
+	if err != nil {
+		return Endpoints{}, ctr, err
+	}
+
+	broker, err := ctr.KafkaSeedBroker(t.Context())
+	if err != nil {
+		return Endpoints{}, ctr, err
+	}
+
+	srAddr, err := ctr.SchemaRegistryAddress(t.Context())
+	if err != nil {
+		return Endpoints{}, ctr, err
+	}
+
+	return Endpoints{
+		BrokerAddr:        broker,
+		SchemaRegistryURL: srAddr,
+	}, ctr, nil
+}
+
+// StartRedpanda starts a Redpanda container.
+//
+// Deprecated: Use StartSingleBroker or StartSingleBrokerWithConfig instead.
+func StartRedpanda(t *testing.T, autocreateTopics bool) (Endpoints, error) {
+	t.Helper()
+
+	cfg := Config{
+		AutoCreateTopics: autocreateTopics,
+	}
+
+	endpoints, _, err := StartSingleBrokerWithConfig(t, cfg)
+	return endpoints, err
+}

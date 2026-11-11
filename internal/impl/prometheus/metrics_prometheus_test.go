@@ -1,0 +1,352 @@
+// Copyright 2024 Redpanda Data, Inc.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//    http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package prometheus
+
+import (
+	"fmt"
+	"io"
+	"net/http"
+	"net/http/httptest"
+	"os"
+	"testing"
+	"time"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+)
+
+func promFromYAML(t testing.TB, conf string, args ...any) *metrics {
+	t.Helper()
+
+	pConf, err := configSpec().ParseYAML(fmt.Sprintf(conf, args...), nil)
+	require.NoError(t, err)
+
+	p, err := fromParsed(pConf, nil)
+	require.NoError(t, err)
+
+	return p
+}
+
+func TestPrometheusNoPushGateway(t *testing.T) {
+	p := promFromYAML(t, ``)
+	assert.NotNil(t, p)
+	assert.Nil(t, p.pusher)
+}
+
+func TestPrometheusWithPushGateway(t *testing.T) {
+	pusherChan := make(chan struct{})
+	server := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
+		pusherChan <- struct{}{}
+	}))
+	defer server.Close()
+
+	p := promFromYAML(t, `
+push_url: %v
+`, server.URL)
+	assert.NotNil(t, p.pusher)
+
+	go func() {
+		if err := p.Close(t.Context()); err != nil {
+			t.Error(err)
+		}
+	}()
+
+	// Wait for message for the PushGateway after close
+	select {
+	case <-pusherChan:
+	case <-time.After(100 * time.Millisecond):
+		assert.Fail(t, "PushGateway did not receive expected messages")
+	}
+}
+
+func TestPrometheusWithPushGatewayAndPushInterval(t *testing.T) {
+	pusherChan := make(chan struct{})
+	server := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
+		pusherChan <- struct{}{}
+	}))
+	defer server.Close()
+
+	pushInterval := 1 * time.Millisecond
+	p := promFromYAML(t, `
+push_url: %v
+push_interval: %v
+`, server.URL, pushInterval.String())
+	assert.NotNil(t, p.pusher)
+
+	// Wait for first message for the PushGateway
+	select {
+	case <-pusherChan:
+	case <-time.After(100 * time.Millisecond):
+		assert.Fail(t, "PushGateway did not receive expected messages")
+	}
+
+	go func() {
+		assert.NoError(t, p.Close(t.Context()))
+	}()
+
+	// Wait for another message for the PushGateway (might not be the one sent on close)
+	select {
+	case <-pusherChan:
+	case <-time.After(100 * time.Millisecond):
+		assert.Fail(t, "PushGateway did not receive expected messages after close")
+	}
+}
+
+func getTestProm(t *testing.T) (*metrics, http.HandlerFunc) {
+	t.Helper()
+
+	prom := promFromYAML(t, ``)
+	return prom, prom.HandlerFunc()
+}
+
+func getPage(t *testing.T, handler http.HandlerFunc) string {
+	t.Helper()
+
+	req := httptest.NewRequest(http.MethodGet, "http://example.com/foo", http.NoBody)
+	w := httptest.NewRecorder()
+	handler(w, req)
+
+	body, err := io.ReadAll(w.Result().Body)
+	require.NoError(t, err)
+
+	return string(body)
+}
+
+type floatCtorExpanded interface {
+	IncrFloat64(f float64)
+}
+
+type floatGagExpanded interface {
+	SetFloat64(f float64)
+}
+
+func TestPrometheusMetrics(t *testing.T) {
+	nm, handler := getTestProm(t)
+
+	ctr := nm.NewCounterCtor("counterone")()
+	ctr.Incr(10)
+	ctr.Incr(11)
+
+	gge := nm.NewGaugeCtor("gaugeone")()
+	gge.Set(12)
+
+	tmr := nm.NewTimerCtor("timerone")()
+	tmr.Timing(13)
+
+	ctrTwo := nm.NewCounterCtor("countertwo", "label1")
+	ctrTwo("value1").Incr(10)
+	ctrTwo("value2").Incr(11)
+	ctrTwo("value3").(floatCtorExpanded).IncrFloat64(10.452)
+
+	ggeTwo := nm.NewGaugeCtor("gaugetwo", "label2")
+	ggeTwo("value3").Set(12)
+
+	ggeThree := nm.NewGaugeCtor("gaugethree")()
+	ggeThree.(floatGagExpanded).SetFloat64(10.452)
+
+	tmrTwo := nm.NewTimerCtor("timertwo", "label3", "label4")
+	tmrTwo("value4", "value5").Timing(13)
+
+	body := getPage(t, handler)
+
+	assert.Contains(t, body, "\ncounterone 21")
+	assert.Contains(t, body, "\ngaugeone 12")
+	assert.Contains(t, body, "\ntimerone_count 1")
+	assert.Contains(t, body, "\ncountertwo{label1=\"value1\"} 10")
+	assert.Contains(t, body, "\ncountertwo{label1=\"value2\"} 11")
+	assert.Contains(t, body, "\ncountertwo{label1=\"value3\"} 10.452")
+	assert.Contains(t, body, "\ngaugetwo{label2=\"value3\"} 12")
+	assert.Contains(t, body, "\ntimertwo_sum{label3=\"value4\",label4=\"value5\"} 13")
+	assert.Contains(t, body, "\ngaugethree 10.452")
+}
+
+func TestPrometheusDeleteSeriesPartialMatch(t *testing.T) {
+	nm, handler := getTestProm(t)
+
+	ctr := nm.NewCounterCtor("input_received", "label", "stream")
+	ctr("in", "foo").Incr(3)
+	ctr("in", "bar").Incr(4)
+
+	gge := nm.NewGaugeCtor("input_connection_up", "stream")
+	gge("foo").Set(1)
+	gge("bar").Set(1)
+
+	tmr := nm.NewTimerCtor("input_latency_ns", "stream")
+	tmr("foo").Timing(100)
+	tmr("bar").Timing(200)
+
+	unlabelled := nm.NewCounterCtor("uptime")()
+	unlabelled.Incr(9)
+
+	// A vec with labels that do not include the matched key must be untouched:
+	// client_golang treats an unknown label key as a non-match, not a wildcard.
+	otherLabels := nm.NewCounterCtor("batch_created", "mechanism")
+	otherLabels("count").Incr(5)
+
+	body := getPage(t, handler)
+	require.Contains(t, body, "\ninput_received{label=\"in\",stream=\"foo\"} 3")
+	require.Contains(t, body, "\ninput_latency_ns_sum{stream=\"foo\"} 100")
+
+	// The exporter is bound to service.MetricsExporterSeriesDeleter by a
+	// compile-time assertion in metrics_prometheus.go, so the method can be
+	// exercised directly here.
+	nm.DeleteSeriesPartialMatch(map[string]string{"stream": "foo"})
+
+	body = getPage(t, handler)
+	assert.NotContains(t, body, "stream=\"foo\"")
+	assert.Contains(t, body, "\ninput_received{label=\"in\",stream=\"bar\"} 4")
+	assert.Contains(t, body, "\ninput_connection_up{stream=\"bar\"} 1")
+	assert.Contains(t, body, "\ninput_latency_ns_sum{stream=\"bar\"} 200")
+	assert.Contains(t, body, "\nuptime 9")
+	assert.Contains(t, body, "\nbatch_created{mechanism=\"count\"} 5")
+}
+
+func TestPrometheusDeleteSeriesPartialMatchHistogram(t *testing.T) {
+	nm := promFromYAML(t, `
+use_histogram_timing: true
+`)
+
+	tmr := nm.NewTimerCtor("input_latency_ns", "stream")
+	tmr("foo").Timing(100)
+	tmr("bar").Timing(200)
+
+	handler := nm.HandlerFunc()
+	body := getPage(t, handler)
+	require.Contains(t, body, "stream=\"foo\"")
+
+	nm.DeleteSeriesPartialMatch(map[string]string{"stream": "foo"})
+
+	body = getPage(t, handler)
+	assert.NotContains(t, body, "stream=\"foo\"")
+	assert.Contains(t, body, "\ninput_latency_ns_count{stream=\"bar\"} 1")
+}
+
+func TestPrometheusHistMetrics(t *testing.T) {
+	nm := promFromYAML(t, `
+use_histogram_timing: true
+`)
+
+	applyTestMetrics(nm)
+
+	tmr := nm.NewTimerCtor("timerone")()
+	tmr.Timing(13)
+	tmrTwo := nm.NewTimerCtor("timertwo", "label3", "label4")
+	tmrTwo("value4", "value5").Timing(14)
+
+	handler := nm.HandlerFunc()
+	body := getPage(t, handler)
+
+	assertContainsTestMetrics(t, body)
+	assert.Contains(t, body, "\ntimerone_sum 1.3e-08")
+	assert.Contains(t, body, "\ntimertwo_sum{label3=\"value4\",label4=\"value5\"} 1.4e-08")
+}
+
+// In histogram mode timings are recorded in seconds, so a `_ns`-suffixed metric
+// is renamed to `_seconds` to reflect the unit. This also ensures the histogram
+// variant uses a distinct series name from the summary variant emitted by nodes
+// with use_histogram_timing disabled, avoiding remote-write metric-kind
+// conflicts in a mixed fleet. See INC-1095.
+func TestPrometheusHistogramTimingSecondsSuffix(t *testing.T) {
+	tests := []struct {
+		name        string
+		conf        string
+		wantType    string
+		wantSum     string
+		wantMissing string
+	}{
+		{
+			name:        "histogram with suffix rewrite renames _ns to _seconds",
+			conf:        "use_histogram_timing: true\nhistogram_timing_seconds_suffix: true\n",
+			wantType:    "\n# TYPE processor_latency_seconds histogram",
+			wantSum:     "\nprocessor_latency_seconds_sum 2",
+			wantMissing: "processor_latency_ns",
+		},
+		{
+			// The default keeps existing histogram series names so upgrades
+			// don't silently break dashboards and alerts.
+			name:        "histogram without suffix rewrite keeps _ns",
+			conf:        "use_histogram_timing: true\n",
+			wantType:    "\n# TYPE processor_latency_ns histogram",
+			wantSum:     "\nprocessor_latency_ns_sum 2",
+			wantMissing: "processor_latency_seconds",
+		},
+		{
+			name:        "summary ignores suffix rewrite",
+			conf:        "histogram_timing_seconds_suffix: true\n",
+			wantType:    "\n# TYPE processor_latency_ns summary",
+			wantSum:     "\nprocessor_latency_ns_sum 2e+09",
+			wantMissing: "processor_latency_seconds",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			nm := promFromYAML(t, "%s", tt.conf)
+
+			tmr := nm.NewTimerCtor("processor_latency_ns")()
+			tmr.Timing(2_000_000_000) // 2s expressed in nanoseconds
+
+			body := getPage(t, nm.HandlerFunc())
+
+			assert.Contains(t, body, tt.wantType)
+			assert.Contains(t, body, tt.wantSum)
+			assert.NotContains(t, body, tt.wantMissing)
+		})
+	}
+}
+
+func TestPrometheusWithFileOutputPath(t *testing.T) {
+	fPath := t.TempDir() + "/benthos_metrics.prom"
+
+	p := promFromYAML(t, `
+file_output_path: %v
+`, fPath)
+	applyTestMetrics(p)
+
+	assert.Nil(t, p.pusher)
+
+	err := p.Close(t.Context())
+	assert.NoError(t, err)
+
+	assert.FileExists(t, fPath)
+	file, err := os.ReadFile(fPath)
+	assert.NoError(t, err)
+	assert.NotEmpty(t, file)
+
+	assertContainsTestMetrics(t, string(file))
+}
+
+func applyTestMetrics(nm *metrics) {
+	ctr := nm.NewCounterCtor("counterone")()
+	ctr.Incr(10)
+	ctr.Incr(11)
+
+	gge := nm.NewGaugeCtor("gaugeone")()
+	gge.Set(12)
+
+	ctrTwo := nm.NewCounterCtor("countertwo", "label1")
+	ctrTwo("value1").Incr(10)
+	ctrTwo("value2").Incr(11)
+
+	ggeTwo := nm.NewGaugeCtor("gaugetwo", "label2")
+	ggeTwo("value3").Set(12)
+}
+
+func assertContainsTestMetrics(t *testing.T, body string) {
+	assert.Contains(t, body, "\ncounterone 21")
+	assert.Contains(t, body, "\ngaugeone 12")
+	assert.Contains(t, body, "\ncountertwo{label1=\"value1\"} 10")
+	assert.Contains(t, body, "\ncountertwo{label1=\"value2\"} 11")
+	assert.Contains(t, body, "\ngaugetwo{label2=\"value3\"} 12")
+}

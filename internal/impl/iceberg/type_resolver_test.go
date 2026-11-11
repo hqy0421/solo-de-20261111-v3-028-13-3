@@ -1,0 +1,796 @@
+// Copyright 2026 Redpanda Data, Inc.
+//
+// Licensed as a Redpanda Enterprise file under the Redpanda Community
+// License (the "License"); you may not use this file except in compliance with
+// the License. You may obtain a copy of the License at
+//
+// https://github.com/redpanda-data/redpanda/blob/master/licenses/rcl.md
+
+package iceberg
+
+import (
+	"testing"
+
+	"github.com/apache/iceberg-go"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+
+	"github.com/redpanda-data/benthos/v4/public/bloblang"
+	"github.com/redpanda-data/benthos/v4/public/schema"
+	"github.com/redpanda-data/benthos/v4/public/service"
+
+	"github.com/redpanda-data/connect/v4/internal/impl/iceberg/icebergx"
+)
+
+func TestParseIcebergTypeString(t *testing.T) {
+	tests := []struct {
+		input   string
+		want    string
+		wantErr bool
+	}{
+		{"boolean", "boolean", false},
+		{"int", "int", false},
+		{"long", "long", false},
+		{"float", "float", false},
+		{"double", "double", false},
+		{"string", "string", false},
+		{"binary", "binary", false},
+		{"date", "date", false},
+		{"time", "time", false},
+		{"timestamp", "timestamp", false},
+		{"timestamptz", "timestamptz", false},
+		{"timestamp_ns", "timestamp_ns", false},
+		{"timestamptz_ns", "timestamptz_ns", false},
+		{"uuid", "uuid", false},
+		// Case insensitivity
+		{"Boolean", "boolean", false},
+		{"STRING", "string", false},
+		{"Long", "long", false},
+		// Whitespace
+		{" string ", "string", false},
+		{"  int  ", "int", false},
+		// Decimal
+		{"decimal(10, 2)", "decimal(10, 2)", false},
+		{"decimal(38,0)", "decimal(38, 0)", false},
+		{"Decimal(5, 3)", "decimal(5, 3)", false},
+		// Fixed
+		{"fixed[16]", "fixed[16]", false},
+		{"fixed[4]", "fixed[4]", false},
+		{"Fixed[32]", "fixed[32]", false},
+		// Errors
+		{"unknown", "", true},
+		{"", "", true},
+		{"decimal()", "", true},
+		{"fixed[]", "", true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.input, func(t *testing.T) {
+			got, err := parseIcebergTypeString(tt.input)
+			if tt.wantErr {
+				require.Error(t, err)
+				return
+			}
+			require.NoError(t, err)
+			assert.Equal(t, tt.want, got.Type())
+		})
+	}
+}
+
+func TestCommonTypeToIcebergType(t *testing.T) {
+	tests := []struct {
+		name    string
+		common  schema.Common
+		want    string
+		wantErr bool
+	}{
+		{"Boolean", schema.Common{Type: schema.Boolean}, "boolean", false},
+		{"Int32", schema.Common{Type: schema.Int32}, "int", false},
+		{"Int64", schema.Common{Type: schema.Int64}, "long", false},
+		{"Float32", schema.Common{Type: schema.Float32}, "float", false},
+		{"Float64", schema.Common{Type: schema.Float64}, "double", false},
+		{"String", schema.Common{Type: schema.String}, "string", false},
+		{"ByteArray", schema.Common{Type: schema.ByteArray}, "binary", false},
+		{"Timestamp", schema.Common{Type: schema.Timestamp}, "timestamptz", false},
+		{"Any fallback", schema.Common{Type: schema.Any}, "string", false},
+		{"Null fallback", schema.Common{Type: schema.Null}, "string", false},
+		{"Object", schema.Common{
+			Type: schema.Object,
+			Children: []schema.Common{
+				{Name: "name", Type: schema.String},
+				{Name: "age", Type: schema.Int32},
+			},
+		}, "struct", false},
+		{"Array", schema.Common{
+			Type:     schema.Array,
+			Children: []schema.Common{{Type: schema.String}},
+		}, "list", false},
+		{"Decimal precision/scale", schema.Common{
+			Name:    "amount",
+			Type:    schema.Decimal,
+			Logical: &schema.LogicalParams{Decimal: &schema.DecimalParams{Precision: 18, Scale: 4}},
+		}, "decimal(18, 4)", false},
+		{"Decimal missing logical params", schema.Common{
+			Name: "amount",
+			Type: schema.Decimal,
+		}, "", true},
+		{"BigDecimal rejected", schema.Common{
+			Name: "amount",
+			Type: schema.BigDecimal,
+		}, "", true},
+		// Logical-type cases the original issue #4399 stopped at INT/BIGINT —
+		// these now produce the right Iceberg column types.
+		{"Timestamp millis UTC default (legacy nil Logical)", schema.Common{Type: schema.Timestamp}, "timestamptz", false},
+		{"Timestamp micros UTC", schema.Common{
+			Type:    schema.Timestamp,
+			Logical: &schema.LogicalParams{Timestamp: &schema.TimestampParams{Unit: schema.TimeUnitMicros, AdjustToUTC: true}},
+		}, "timestamptz", false},
+		{"Timestamp local micros (no tz)", schema.Common{
+			Type:    schema.Timestamp,
+			Logical: &schema.LogicalParams{Timestamp: &schema.TimestampParams{Unit: schema.TimeUnitMicros, AdjustToUTC: false}},
+		}, "timestamp", false},
+		// Nanos still map to the V3 types at this stage so that
+		// new_column_type_mapping can downcast them; the resolver entry
+		// points reject whatever survives (see TestTypeResolverRejectsNanosecondTimestamps).
+		{"Timestamp nanos UTC (V3)", schema.Common{
+			Type:    schema.Timestamp,
+			Logical: &schema.LogicalParams{Timestamp: &schema.TimestampParams{Unit: schema.TimeUnitNanos, AdjustToUTC: true}},
+		}, "timestamptz_ns", false},
+		{"Timestamp local nanos (V3)", schema.Common{
+			Type:    schema.Timestamp,
+			Logical: &schema.LogicalParams{Timestamp: &schema.TimestampParams{Unit: schema.TimeUnitNanos, AdjustToUTC: false}},
+		}, "timestamp_ns", false},
+		{"Date", schema.Common{Type: schema.Date}, "date", false},
+		{"TimeOfDay millis (no tz)", schema.Common{
+			Type:    schema.TimeOfDay,
+			Logical: &schema.LogicalParams{TimeOfDay: &schema.TimeOfDayParams{Unit: schema.TimeUnitMillis}},
+		}, "time", false},
+		{"TimeOfDay micros (no tz)", schema.Common{
+			Type:    schema.TimeOfDay,
+			Logical: &schema.LogicalParams{TimeOfDay: &schema.TimeOfDayParams{Unit: schema.TimeUnitMicros}},
+		}, "time", false},
+		{"TimeOfDay AdjustToUTC rejected (Iceberg has no time-with-tz)", schema.Common{
+			Type:    schema.TimeOfDay,
+			Logical: &schema.LogicalParams{TimeOfDay: &schema.TimeOfDayParams{Unit: schema.TimeUnitMicros, AdjustToUTC: true}},
+		}, "", true},
+		{"TimeOfDay missing Logical rejected", schema.Common{Type: schema.TimeOfDay}, "", true},
+		{"TimeOfDay nanos rejected (Iceberg TIME is micros)", schema.Common{
+			Type:    schema.TimeOfDay,
+			Logical: &schema.LogicalParams{TimeOfDay: &schema.TimeOfDayParams{Unit: schema.TimeUnitNanos}},
+		}, "", true},
+		{"UUID", schema.Common{Type: schema.UUID}, "uuid", false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := commonTypeToIcebergType(&tt.common, newTypeInferrer(true))
+			if tt.wantErr {
+				require.Error(t, err)
+				return
+			}
+			require.NoError(t, err)
+			assert.Equal(t, tt.want, got.Type())
+		})
+	}
+}
+
+// TestCommonTypeToIcebergType_MapAndUnion closes the coverage gap the
+// common-schema-audit skill flagged: Map and Union previously fell into
+// the type switch's `default` arm with a generic "unsupported" error.
+// Map now maps to MapType<String, Value>; Union still errors but with a
+// remediation-pointer message rather than the generic one.
+func TestCommonTypeToIcebergType_MapAndUnion(t *testing.T) {
+	t.Run("Map of String->Int64", func(t *testing.T) {
+		root := schema.Common{
+			Type:     schema.Map,
+			Children: []schema.Common{{Type: schema.Int64}},
+		}
+		got, err := commonTypeToIcebergType(&root, newTypeInferrer(true))
+		require.NoError(t, err)
+		mt, ok := got.(*iceberg.MapType)
+		require.True(t, ok, "want *iceberg.MapType, got %T", got)
+		assert.Equal(t, "string", mt.KeyType.Type())
+		assert.Equal(t, "long", mt.ValueType.Type())
+	})
+
+	t.Run("Map of String->Timestamp", func(t *testing.T) {
+		root := schema.Common{
+			Type: schema.Map,
+			Children: []schema.Common{
+				{Type: schema.Timestamp, Logical: &schema.LogicalParams{
+					Timestamp: &schema.TimestampParams{Unit: schema.TimeUnitMillis, AdjustToUTC: true},
+				}},
+			},
+		}
+		got, err := commonTypeToIcebergType(&root, newTypeInferrer(true))
+		require.NoError(t, err)
+		mt, ok := got.(*iceberg.MapType)
+		require.True(t, ok)
+		assert.Equal(t, "timestamptz", mt.ValueType.Type())
+	})
+
+	t.Run("Map with wrong child arity errors clearly", func(t *testing.T) {
+		root := schema.Common{Type: schema.Map}
+		_, err := commonTypeToIcebergType(&root, newTypeInferrer(true))
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "exactly one value-type child")
+	})
+
+	t.Run("Union refused loudly", func(t *testing.T) {
+		root := schema.Common{Name: "u", Type: schema.Union}
+		_, err := commonTypeToIcebergType(&root, newTypeInferrer(true))
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "Union")
+		assert.Contains(t, err.Error(), "flatten", "error must point at the upstream remediation")
+	})
+}
+
+func TestFindCommonField(t *testing.T) {
+	root := schema.Common{
+		Type: schema.Object,
+		Children: []schema.Common{
+			{Name: "name", Type: schema.String},
+			{Name: "parent", Type: schema.Object, Children: []schema.Common{
+				{Name: "child", Type: schema.Int64},
+			}},
+			{Name: "items", Type: schema.Array, Children: []schema.Common{
+				{Type: schema.Object, Children: []schema.Common{
+					{Name: "sku", Type: schema.String},
+				}},
+			}},
+		},
+	}
+
+	tests := []struct {
+		name  string
+		path  icebergx.Path
+		want  bool
+		wType schema.CommonType
+	}{
+		{
+			name:  "flat field",
+			path:  icebergx.Path{{Kind: icebergx.PathField, Name: "name"}},
+			want:  true,
+			wType: schema.String,
+		},
+		{
+			name: "nested field",
+			path: icebergx.Path{
+				{Kind: icebergx.PathField, Name: "parent"},
+				{Kind: icebergx.PathField, Name: "child"},
+			},
+			want:  true,
+			wType: schema.Int64,
+		},
+		{
+			name: "array element field",
+			path: icebergx.Path{
+				{Kind: icebergx.PathField, Name: "items"},
+				{Kind: icebergx.PathListElement},
+				{Kind: icebergx.PathField, Name: "sku"},
+			},
+			want:  true,
+			wType: schema.String,
+		},
+		{
+			name:  "missing field",
+			path:  icebergx.Path{{Kind: icebergx.PathField, Name: "nonexistent"}},
+			want:  false,
+			wType: 0,
+		},
+		{
+			name:  "empty path",
+			path:  icebergx.Path{},
+			want:  false,
+			wType: 0,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, found := findCommonField(root, tt.path, true)
+			assert.Equal(t, tt.want, found)
+			if found {
+				assert.Equal(t, tt.wType, got.Type)
+			}
+		})
+	}
+}
+
+// TestFindCommonFieldCaseInsensitive verifies that schema_metadata lookups
+// fold case when the resolver is configured for case-insensitive matching,
+// so a metadata schema authored with iceberg-canonical (typically lowercase)
+// names resolves types for paths derived from arbitrarily-cased input keys.
+func TestFindCommonFieldCaseInsensitive(t *testing.T) {
+	root := schema.Common{
+		Type: schema.Object,
+		Children: []schema.Common{
+			{Name: "name", Type: schema.String},
+			{Name: "parent", Type: schema.Object, Children: []schema.Common{
+				{Name: "child", Type: schema.Int64},
+			}},
+		},
+	}
+
+	t.Run("uppercase path matches lowercase metadata", func(t *testing.T) {
+		got, found := findCommonField(root, icebergx.Path{
+			{Kind: icebergx.PathField, Name: "NAME"},
+		}, false)
+		require.True(t, found)
+		assert.Equal(t, schema.String, got.Type)
+	})
+
+	t.Run("mixed case nested path matches", func(t *testing.T) {
+		got, found := findCommonField(root, icebergx.Path{
+			{Kind: icebergx.PathField, Name: "Parent"},
+			{Kind: icebergx.PathField, Name: "CHILD"},
+		}, false)
+		require.True(t, found)
+		assert.Equal(t, schema.Int64, got.Type)
+	})
+
+	t.Run("case-sensitive mode preserves strict matching", func(t *testing.T) {
+		_, found := findCommonField(root, icebergx.Path{
+			{Kind: icebergx.PathField, Name: "NAME"},
+		}, true)
+		assert.False(t, found)
+	})
+}
+
+// TestCommonObjectToIcebergStructRejectsCaseOnlyDuplicates covers the
+// metadata-driven counterpart of TestInferStructTypeRejectsCaseOnlyDuplicates:
+// when a customer's schema_metadata declares two children that differ only in
+// case, the resulting iceberg struct would self-collide under iceberg's
+// case-insensitive convention. Refuse rather than silently produce a broken
+// struct.
+func TestCommonObjectToIcebergStructRejectsCaseOnlyDuplicates(t *testing.T) {
+	root := schema.Common{
+		Type: schema.Object,
+		Children: []schema.Common{
+			{Name: "Foo", Type: schema.String},
+			{Name: "FOO", Type: schema.String},
+		},
+	}
+
+	t.Run("case-insensitive rejects", func(t *testing.T) {
+		_, err := commonTypeToIcebergType(&root, newTypeInferrer(false))
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "ambiguous struct fields")
+	})
+
+	t.Run("case-sensitive admits", func(t *testing.T) {
+		got, err := commonTypeToIcebergType(&root, newTypeInferrer(true))
+		require.NoError(t, err)
+		assert.Equal(t, "struct", got.Type())
+	})
+}
+
+func TestIsPrimitiveType(t *testing.T) {
+	assert.True(t, isPrimitiveType(iceberg.StringType{}))
+	assert.True(t, isPrimitiveType(iceberg.BooleanType{}))
+	assert.True(t, isPrimitiveType(iceberg.Int32Type{}))
+	assert.True(t, isPrimitiveType(iceberg.Float64Type{}))
+	assert.False(t, isPrimitiveType(&iceberg.StructType{}))
+	assert.False(t, isPrimitiveType(&iceberg.ListType{}))
+	assert.False(t, isPrimitiveType(&iceberg.MapType{}))
+}
+
+func mustParseBloblang(t *testing.T, mapping string) *bloblang.Executor {
+	t.Helper()
+	exec, err := bloblang.Parse(mapping)
+	require.NoError(t, err)
+	return exec
+}
+
+func TestTypeResolverResolveTypeForAddColumn(t *testing.T) {
+	t.Run("default inference", func(t *testing.T) {
+		r := newTypeResolver("", nil, true, nil)
+
+		msg := service.NewMessage(nil)
+		msg.SetStructuredMut(map[string]any{"name": "hello"})
+
+		field := NewUnknownFieldError(nil, "name", "hello")
+		got, err := r.resolveTypeForAddColumn(field, msg, "ns", "tbl")
+		require.NoError(t, err)
+		assert.Equal(t, "string", got.Type())
+
+		field = NewUnknownFieldError(nil, "count", 42)
+		got, err = r.resolveTypeForAddColumn(field, msg, "ns", "tbl")
+		require.NoError(t, err)
+		assert.Equal(t, "long", got.Type())
+	})
+
+	t.Run("schema_metadata override", func(t *testing.T) {
+		r := newTypeResolver("test_schema", nil, true, nil)
+
+		commonSchema := schema.Common{
+			Type: schema.Object,
+			Children: []schema.Common{
+				{Name: "count", Type: schema.Int64},
+			},
+		}
+		msg := service.NewMessage(nil)
+		msg.SetStructuredMut(map[string]any{"count": 42})
+		msg.MetaSetMut("test_schema", commonSchema.ToAny())
+
+		field := NewUnknownFieldError(nil, "count", 42)
+		got, err := r.resolveTypeForAddColumn(field, msg, "ns", "tbl")
+		require.NoError(t, err)
+		assert.Equal(t, "long", got.Type(), "should use Int64 from schema metadata, not Float64 from inference")
+	})
+
+	t.Run("bloblang mapping override", func(t *testing.T) {
+		exec := mustParseBloblang(t, `root = "long"`)
+		r := newTypeResolver("", exec, true, nil)
+
+		msg := service.NewMessage(nil)
+		msg.SetStructuredMut(map[string]any{"count": 42})
+
+		field := NewUnknownFieldError(nil, "count", 42)
+		got, err := r.resolveTypeForAddColumn(field, msg, "ns", "tbl")
+		require.NoError(t, err)
+		assert.Equal(t, "long", got.Type())
+	})
+
+	t.Run("schema_metadata then mapping", func(t *testing.T) {
+		exec := mustParseBloblang(t, `root = "long"`)
+		r := newTypeResolver("test_schema", exec, true, nil)
+
+		commonSchema := schema.Common{
+			Type: schema.Object,
+			Children: []schema.Common{
+				{Name: "count", Type: schema.Int32},
+			},
+		}
+		msg := service.NewMessage(nil)
+		msg.SetStructuredMut(map[string]any{"count": 42})
+		msg.MetaSetMut("test_schema", commonSchema.ToAny())
+
+		field := NewUnknownFieldError(nil, "count", 42)
+		got, err := r.resolveTypeForAddColumn(field, msg, "ns", "tbl")
+		require.NoError(t, err)
+		// Mapping sees inferred_type="int" (from schema_metadata) and overrides to "long"
+		assert.Equal(t, "long", got.Type())
+	})
+
+	t.Run("struct type skips mapping", func(t *testing.T) {
+		exec := mustParseBloblang(t, `root = "string"`)
+		r := newTypeResolver("test_schema", exec, true, nil)
+
+		commonSchema := schema.Common{
+			Type: schema.Object,
+			Children: []schema.Common{
+				{Name: "nested", Type: schema.Object, Children: []schema.Common{
+					{Name: "x", Type: schema.String},
+				}},
+			},
+		}
+		msg := service.NewMessage(nil)
+		msg.SetStructuredMut(map[string]any{"nested": map[string]any{"x": "hello"}})
+		msg.MetaSetMut("test_schema", commonSchema.ToAny())
+
+		field := NewUnknownFieldError(nil, "nested", map[string]any{"x": "hello"})
+		got, err := r.resolveTypeForAddColumn(field, msg, "ns", "tbl")
+		require.NoError(t, err)
+		assert.Equal(t, "struct", got.Type(), "struct type should skip the bloblang mapping")
+	})
+
+	t.Run("mapping receives inferred_type", func(t *testing.T) {
+		exec := mustParseBloblang(t, `root = if this.inferred_type == "long" { "decimal(10, 2)" } else { this.inferred_type }`)
+		r := newTypeResolver("", exec, true, nil)
+
+		msg := service.NewMessage(nil)
+		msg.SetStructuredMut(map[string]any{"count": 42, "name": "test"})
+
+		// Numeric → inferred as "long" → mapping converts to "decimal(10, 2)"
+		field := NewUnknownFieldError(nil, "count", 42)
+		got, err := r.resolveTypeForAddColumn(field, msg, "ns", "tbl")
+		require.NoError(t, err)
+		assert.Equal(t, "decimal(10, 2)", got.Type())
+
+		// String → inferred as "string" → mapping passes through
+		field = NewUnknownFieldError(nil, "name", "test")
+		got, err = r.resolveTypeForAddColumn(field, msg, "ns", "tbl")
+		require.NoError(t, err)
+		assert.Equal(t, "string", got.Type())
+	})
+
+	t.Run("schema_metadata configured but missing on message", func(t *testing.T) {
+		r := newTypeResolver("test_schema", nil, true, nil)
+
+		msg := service.NewMessage(nil)
+		msg.SetStructuredMut(map[string]any{"count": 42})
+
+		field := NewUnknownFieldError(nil, "count", 42)
+		got, err := r.resolveTypeForAddColumn(field, msg, "ns", "tbl")
+		require.NoError(t, err, "should not error when schema_metadata is missing from message")
+		assert.Equal(t, "long", got.Type(), "should fall back to inference")
+	})
+}
+
+func TestTypeResolverResolveTypeForCreateTable(t *testing.T) {
+	t.Run("default inference", func(t *testing.T) {
+		r := newTypeResolver("", nil, true, nil)
+
+		msg := service.NewMessage(nil)
+		msg.SetStructuredMut(map[string]any{"name": "hello"})
+
+		got, err := r.resolveTypeForCreateTable("name", "hello", msg, nil, "ns", "tbl", newTypeInferrer(true))
+		require.NoError(t, err)
+		assert.Equal(t, "string", got.Type())
+	})
+
+	t.Run("nil value returns nil", func(t *testing.T) {
+		r := newTypeResolver("", nil, true, nil)
+
+		msg := service.NewMessage(nil)
+		msg.SetStructuredMut(map[string]any{})
+
+		got, err := r.resolveTypeForCreateTable("name", nil, msg, nil, "ns", "tbl", newTypeInferrer(true))
+		require.NoError(t, err)
+		assert.Nil(t, got)
+	})
+
+	t.Run("schema_metadata override", func(t *testing.T) {
+		r := newTypeResolver("test_schema", nil, true, nil)
+
+		commonSchema := schema.Common{
+			Type: schema.Object,
+			Children: []schema.Common{
+				{Name: "count", Type: schema.Int64},
+			},
+		}
+		msg := service.NewMessage(nil)
+		msg.SetStructuredMut(map[string]any{"count": 42})
+		msg.MetaSetMut("test_schema", commonSchema.ToAny())
+
+		common, err := r.parseSchemaMetadata(msg)
+		require.NoError(t, err)
+		got, err := r.resolveTypeForCreateTable("count", 42, msg, common, "ns", "tbl", newTypeInferrer(true))
+		require.NoError(t, err)
+		assert.Equal(t, "long", got.Type())
+	})
+
+	t.Run("bloblang mapping override", func(t *testing.T) {
+		exec := mustParseBloblang(t, `root = "long"`)
+		r := newTypeResolver("", exec, true, nil)
+
+		msg := service.NewMessage(nil)
+		msg.SetStructuredMut(map[string]any{"count": 42})
+
+		got, err := r.resolveTypeForCreateTable("count", 42, msg, nil, "ns", "tbl", newTypeInferrer(true))
+		require.NoError(t, err)
+		assert.Equal(t, "long", got.Type())
+	})
+
+	t.Run("schema_metadata configured but missing on message", func(t *testing.T) {
+		r := newTypeResolver("test_schema", nil, true, nil)
+
+		msg := service.NewMessage(nil)
+		msg.SetStructuredMut(map[string]any{"count": 42})
+
+		common, err := r.parseSchemaMetadata(msg)
+		require.NoError(t, err)
+		got, err := r.resolveTypeForCreateTable("count", 42, msg, common, "ns", "tbl", newTypeInferrer(true))
+		require.NoError(t, err, "should not error when schema_metadata is missing from message")
+		assert.Equal(t, "long", got.Type(), "should fall back to inference")
+	})
+
+	t.Run("shared allocator produces unique field IDs across nested structs", func(t *testing.T) {
+		r := newTypeResolver("", nil, true, nil)
+		ti := newTypeInferrer(true)
+
+		record := map[string]any{
+			"id": int64(1),
+			"source": map[string]any{
+				"account_id": "ACC-123",
+				"bank_code":  "SWIFT-XYZ",
+			},
+			"destination": map[string]any{
+				"account_id": "ACC-456",
+				"bank_code":  "SWIFT-ABC",
+			},
+		}
+
+		msg := service.NewMessage(nil)
+		msg.SetStructuredMut(record)
+
+		// Build fields the same way buildSchemaWithResolver does.
+		var allIDs []int
+		for name, value := range record {
+			fieldType, err := r.resolveTypeForCreateTable(name, value, msg, nil, "ns", "tbl", ti)
+			require.NoError(t, err)
+			if fieldType == nil {
+				continue
+			}
+			topID := ti.allocateFieldID()
+			allIDs = append(allIDs, topID)
+
+			// Collect nested field IDs from struct types.
+			if st, ok := fieldType.(*iceberg.StructType); ok {
+				for _, f := range st.FieldList {
+					allIDs = append(allIDs, f.ID)
+				}
+			}
+		}
+
+		// Every ID must be unique — this is the regression test for the collision bug.
+		seen := make(map[int]bool, len(allIDs))
+		for _, id := range allIDs {
+			assert.False(t, seen[id], "duplicate field ID %d — nested struct IDs collide with top-level", id)
+			seen[id] = true
+		}
+		assert.GreaterOrEqual(t, len(allIDs), 7, "expected at least 7 fields (1 primitive + 2 structs with 2 fields each)")
+	})
+
+	t.Run("schema_metadata override shares allocator with stage 1", func(t *testing.T) {
+		// Two top-level fields are both objects described in schema_metadata. Without
+		// threading the shared `ti` through the override path, each metadata-resolved
+		// struct would re-start IDs at 1, colliding with each other and with stage-1
+		// inferred fields.
+		commonRoot := schema.Common{
+			Type: schema.Object,
+			Children: []schema.Common{
+				{Name: "source", Type: schema.Object, Children: []schema.Common{
+					{Name: "account_id", Type: schema.String},
+					{Name: "bank_code", Type: schema.String},
+				}},
+				{Name: "destination", Type: schema.Object, Children: []schema.Common{
+					{Name: "account_id", Type: schema.String},
+					{Name: "bank_code", Type: schema.String},
+				}},
+			},
+		}
+
+		r := newTypeResolver("test_schema", nil, true, nil)
+		ti := newTypeInferrer(true)
+
+		record := map[string]any{
+			"source": map[string]any{
+				"account_id": "ACC-123",
+				"bank_code":  "SWIFT-XYZ",
+			},
+			"destination": map[string]any{
+				"account_id": "ACC-456",
+				"bank_code":  "SWIFT-ABC",
+			},
+		}
+		msg := service.NewMessage(nil)
+		msg.SetStructuredMut(record)
+		msg.MetaSetMut("test_schema", commonRoot.ToAny())
+
+		common, err := r.parseSchemaMetadata(msg)
+		require.NoError(t, err)
+
+		var allIDs []int
+		for name, value := range record {
+			fieldType, err := r.resolveTypeForCreateTable(name, value, msg, common, "ns", "tbl", ti)
+			require.NoError(t, err)
+			require.NotNil(t, fieldType)
+			topID := ti.allocateFieldID()
+			allIDs = append(allIDs, topID)
+
+			st, ok := fieldType.(*iceberg.StructType)
+			require.True(t, ok, "expected metadata override to return StructType")
+			for _, f := range st.FieldList {
+				allIDs = append(allIDs, f.ID)
+			}
+		}
+
+		seen := make(map[int]bool, len(allIDs))
+		for _, id := range allIDs {
+			assert.False(t, seen[id], "duplicate field ID %d — metadata-override path is not sharing ti", id)
+			seen[id] = true
+		}
+		assert.Len(t, allIDs, 6, "expected 2 top-level + 4 nested IDs")
+	})
+}
+
+// TestTypeResolverRejectsNanosecondTimestamps guards CON-521 at both resolver
+// entry points: a nanosecond timestamp that survives all three stages is
+// rejected with errNanosecondTimestamp and the column path, while a
+// new_column_type_mapping that downcasts it is honored.
+func TestTypeResolverRejectsNanosecondTimestamps(t *testing.T) {
+	nanos := func(name string) schema.Common {
+		return schema.Common{
+			Name:    name,
+			Type:    schema.Timestamp,
+			Logical: &schema.LogicalParams{Timestamp: &schema.TimestampParams{Unit: schema.TimeUnitNanos, AdjustToUTC: true}},
+		}
+	}
+
+	tests := []struct {
+		name        string
+		field       schema.Common
+		mapping     string
+		wantType    string
+		wantPath    string
+		wantMapHint bool
+	}{
+		{
+			name:        "leaf rejected, suggests mapping",
+			field:       nanos("ts"),
+			wantPath:    "ts",
+			wantMapHint: true,
+		},
+		{
+			name:     "leaf downcast by new_column_type_mapping",
+			field:    nanos("ts"),
+			mapping:  `root = "timestamptz"`,
+			wantType: "timestamptz",
+		},
+		{
+			name:        "leaf passed through by new_column_type_mapping still rejected",
+			field:       nanos("ts"),
+			mapping:     `root = this.inferred_type`,
+			wantPath:    "ts",
+			wantMapHint: true,
+		},
+		{
+			name:     "nested in struct",
+			field:    schema.Common{Name: "ts", Type: schema.Object, Children: []schema.Common{nanos("inner")}},
+			wantPath: "ts/inner",
+		},
+		{
+			name:     "list element",
+			field:    schema.Common{Name: "ts", Type: schema.Array, Children: []schema.Common{nanos("")}},
+			wantPath: "ts/[*]",
+		},
+		{
+			name:     "map value",
+			field:    schema.Common{Name: "ts", Type: schema.Map, Children: []schema.Common{nanos("")}},
+			wantPath: "ts/{}",
+		},
+		{
+			name:     "nested is not rescued by a leaf mapping",
+			field:    schema.Common{Name: "ts", Type: schema.Array, Children: []schema.Common{nanos("")}},
+			mapping:  `root = "timestamptz"`,
+			wantPath: "ts/[*]",
+		},
+	}
+
+	check := func(t *testing.T, got iceberg.Type, err error, wantType, wantPath string, wantMapHint bool) {
+		t.Helper()
+		if wantType != "" {
+			require.NoError(t, err)
+			assert.Equal(t, wantType, got.Type())
+			return
+		}
+		require.ErrorIs(t, err, errNanosecondTimestamp)
+		assert.Contains(t, err.Error(), "column "+wantPath+" ")
+		assert.Contains(t, err.Error(), "upstream")
+		if wantMapHint {
+			assert.Contains(t, err.Error(), "new_column_type_mapping")
+		} else {
+			assert.NotContains(t, err.Error(), "new_column_type_mapping")
+		}
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var exec *bloblang.Executor
+			if tt.mapping != "" {
+				exec = mustParseBloblang(t, tt.mapping)
+			}
+			r := newTypeResolver("test_schema", exec, true, nil)
+
+			commonSchema := schema.Common{Type: schema.Object, Children: []schema.Common{tt.field}}
+			msg := service.NewMessage(nil)
+			msg.SetStructuredMut(map[string]any{"ts": "2026-09-24T12:00:00.123456789Z"})
+			msg.MetaSetMut("test_schema", commonSchema.ToAny())
+
+			t.Run("create table", func(t *testing.T) {
+				common, err := r.parseSchemaMetadata(msg)
+				require.NoError(t, err)
+				got, err := r.resolveTypeForCreateTable("ts", "2026-09-24T12:00:00.123456789Z", msg, common, "ns", "tbl", newTypeInferrer(true))
+				check(t, got, err, tt.wantType, tt.wantPath, tt.wantMapHint)
+			})
+
+			t.Run("add column", func(t *testing.T) {
+				field := NewUnknownFieldError(nil, "ts", "2026-09-24T12:00:00.123456789Z")
+				got, err := r.resolveTypeForAddColumn(field, msg, "ns", "tbl")
+				check(t, got, err, tt.wantType, tt.wantPath, tt.wantMapHint)
+			})
+		})
+	}
+}

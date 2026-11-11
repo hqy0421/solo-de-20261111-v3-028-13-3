@@ -1,0 +1,904 @@
+// Copyright 2026 Redpanda Data, Inc.
+//
+// Licensed as a Redpanda Enterprise file under the Redpanda Community
+// License (the "License"); you may not use this file except in compliance with
+// the License. You may obtain a copy of the License at
+//
+// https://github.com/redpanda-data/redpanda/blob/master/licenses/rcl.md
+
+package shredder
+
+import (
+	"encoding/json"
+	"fmt"
+	"math"
+	"math/big"
+	"slices"
+	"strings"
+
+	"github.com/apache/iceberg-go"
+	"github.com/gofrs/uuid/v5"
+	"github.com/parquet-go/parquet-go"
+
+	"github.com/redpanda-data/benthos/v4/public/bloblang"
+	"github.com/redpanda-data/benthos/v4/public/schema"
+
+	"github.com/redpanda-data/connect/v4/internal/impl/iceberg/icebergx"
+	"github.com/redpanda-data/connect/v4/internal/impl/parquet/parquetdecimal"
+)
+
+// RequiredFieldNullError is returned when a required field has a null or missing value.
+type RequiredFieldNullError struct {
+	Field iceberg.NestedField
+	Path  icebergx.Path
+}
+
+func (e *RequiredFieldNullError) Error() string {
+	return fmt.Sprintf("missing required field %q at path %v", e.Field.Name, e.Path)
+}
+
+// ShreddedValue represents a single leaf value with its repetition and definition levels.
+// This is the output of the Dremel shredding algorithm.
+type ShreddedValue struct {
+	// FieldID is the Iceberg field ID for this column.
+	FieldID int
+	// Value is the parquet value (may be null).
+	Value parquet.Value
+	// RepLevel is the repetition level - indicates at what repeated field level
+	// this value repeats (0 = new record, higher = nested repetition).
+	RepLevel int
+	// DefLevel is the definition level - indicates how many optional/repeated
+	// fields in the path are actually defined (non-null).
+	DefLevel int
+}
+
+// Sink receives output from the shredding process.
+type Sink interface {
+	// EmitValue is called for each leaf value with its repetition/definition levels.
+	EmitValue(sv ShreddedValue) error
+
+	// OnNewField is called when a field exists in the input but not in the schema.
+	// path is the parent path (may be empty for top-level fields), name is the unknown field name.
+	//
+	// The value parameter contains the raw input value with the following types:
+	//   - Primitives: string, bool, float64, int64, []byte, etc.
+	//   - Structs: map[string]any
+	//   - Lists: []any
+	//   - Maps: map[string]any (keys are always strings in JSON)
+	//   - Null: nil
+	OnNewField(path icebergx.Path, name string, value any)
+}
+
+// RecordShredder implements the Dremel record shredding algorithm.
+// It converts nested records into flat columnar format with repetition
+// and definition levels that allow perfect reconstruction.
+type RecordShredder struct {
+	schema *iceberg.Schema
+	// rootFields caches schema.Fields() once. iceberg-go's (*Schema).Fields()
+	// defensively clones the whole NestedField slice on every call, so calling
+	// it per-record in Shred was the single largest allocator on the write path
+	// (a 1-vCPU alloc profile attributed ~6.5% of all bytes to that clone). The
+	// schema is immutable for the shredder's lifetime and shredStruct only reads
+	// the slice, so caching one clone is safe.
+	rootFields []iceberg.NestedField
+	// caseSensitive controls how input record keys are matched against schema
+	// field names. When true (the historical default) names are matched
+	// exactly; when false, matching is case-insensitive — which aligns with
+	// iceberg's recommended convention and with engines like Spark and Trino
+	// in their default configurations.
+	caseSensitive bool
+	// duplicateFieldNames records whether any struct in the schema repeats a
+	// field name. When it does, shredStructExact cannot use its matched-count
+	// shortcut: the count is per field, so two fields sharing a name inflate it
+	// and an unaccounted-for input key can be mistaken for a full match, which
+	// would silently drop an unknown-field notification and with it schema
+	// evolution of that column. Pinned by
+	// TestShredStructPathsAgreeWithDuplicateFieldNames.
+	duplicateFieldNames bool
+	// fieldCommons optionally maps an iceberg field ID to the upstream
+	// schema.Common describing the same field. When present, the leaf
+	// value-conversion step uses Logical params (timestamp unit,
+	// AdjustToUTC, time-of-day unit) to interpret numeric inputs into
+	// typed columns instead of guessing. nil entries fall back to the
+	// pre-schema-metadata behavior — see [convertLeafValue].
+	fieldCommons map[int]*schema.Common
+	// StrictTemporalMode causes [convertLeafValue] to refuse numeric
+	// inputs into time-typed columns (TIMESTAMP / TIMESTAMPTZ / DATE /
+	// TIME) when no schema metadata has been registered for that
+	// column. When false (the default), the value converter falls back
+	// to [bloblang.ValueAsTimestamp]'s seconds default — convenient but
+	// silently wrong if the upstream produced a different unit. When
+	// true, the writer fails the batch loudly.
+	//
+	// No effect on time.Time / time.Duration values, which carry their
+	// own unit unambiguously, and no effect on non-time columns. Set
+	// directly on the shredder after construction; operators that
+	// cannot guarantee schema metadata flows end-to-end flip this on to
+	// fail loudly instead of silently corrupting dates by ~50,000 years.
+	StrictTemporalMode bool
+}
+
+// NewRecordShredder creates a new shredder for the given schema.
+// If caseSensitive is true, input keys must match schema field names exactly;
+// if false, matching is case-insensitive (and ambiguous case-only duplicates
+// in the input cause an error).
+func NewRecordShredder(schema *iceberg.Schema, caseSensitive bool) *RecordShredder {
+	rootFields := schema.Fields()
+	return &RecordShredder{
+		schema:              schema,
+		rootFields:          rootFields,
+		caseSensitive:       caseSensitive,
+		duplicateFieldNames: hasDuplicateFieldNames(rootFields),
+	}
+}
+
+// hasDuplicateFieldNames reports whether any struct in the schema tree repeats a
+// field name. Iceberg rejects duplicate field *IDs* but not duplicate names, and
+// nothing upstream of the shredder enforces name uniqueness in case-sensitive
+// mode — so this has to be treated as possible rather than assumed away.
+//
+// Computed once per shredder because it only gates an optimisation
+// (shredStructExact's unknown-field shortcut); the walk is over schema
+// structure, not data, so it costs nothing per record.
+func hasDuplicateFieldNames(fields []iceberg.NestedField) bool {
+	seen := make(map[string]struct{}, len(fields))
+	for _, field := range fields {
+		if _, dup := seen[field.Name]; dup {
+			return true
+		}
+		seen[field.Name] = struct{}{}
+		if nestedHasDuplicateFieldNames(field.Type) {
+			return true
+		}
+	}
+	return false
+}
+
+// nestedHasDuplicateFieldNames recurses into whatever structs a type contains,
+// including through list element and map value types, since those reach
+// shredStruct too.
+func nestedHasDuplicateFieldNames(typ iceberg.Type) bool {
+	switch t := typ.(type) {
+	case *iceberg.StructType:
+		return hasDuplicateFieldNames(t.FieldList)
+	case *iceberg.ListType:
+		return nestedHasDuplicateFieldNames(t.Element)
+	case *iceberg.MapType:
+		return nestedHasDuplicateFieldNames(t.KeyType) || nestedHasDuplicateFieldNames(t.ValueType)
+	default:
+		return false
+	}
+}
+
+// SetFieldSchemaMetadata supplies a field-ID → schema.Common map that the
+// leaf value converter consults when it sees a numeric input destined for a
+// time-typed Iceberg column (TIMESTAMP, TIMESTAMPTZ, TIMESTAMP_NS,
+// TIMESTAMP_TZ_NS, DATE, TIME). Without this map, the converter accepts
+// time.Time / time.Duration / int64 directly but cannot disambiguate the
+// unit of a bare numeric millis vs. micros vs. seconds — and historically
+// defaulted to interpreting numbers as Unix seconds. Supplying this map
+// lets the connector tell the shredder "this column was sourced from an
+// Avro timestamp-millis", which the converter then honours.
+//
+// Passing nil clears any previously-set metadata.
+func (rs *RecordShredder) SetFieldSchemaMetadata(byID map[int]*schema.Common) {
+	rs.fieldCommons = byID
+}
+
+// Shred converts a nested record into a sequence of shredded values.
+// The record should be a map[string]any matching the schema structure.
+// The sink receives each leaf value and notifications of unknown fields.
+func (rs *RecordShredder) Shred(record map[string]any, sink Sink) error {
+	return rs.shredStruct(rs.rootFields, record, nil, 0, 0, 0, sink)
+}
+
+// shredStruct processes a struct value.
+// maxRepLevel is the maximum repetition level at the current nesting depth.
+func (rs *RecordShredder) shredStruct(
+	fields []iceberg.NestedField,
+	value map[string]any,
+	path icebergx.Path,
+	repLevel, defLevel, maxRepLevel int,
+	sink Sink,
+) error {
+	// Case-sensitive matching makes the match-key the identity function, so
+	// schema fields can be looked up directly in the input map and neither of
+	// the two per-record maps below is needed. That path is split out because
+	// this function runs once per record (and once per nested struct within
+	// it), and a 1-vCPU allocation profile attributed a material share of the
+	// sink's total allocations to those two maps.
+	if rs.caseSensitive {
+		return rs.shredStructExact(fields, value, path, repLevel, defLevel, maxRepLevel, sink)
+	}
+
+	// The case-insensitive body stays inline here rather than in a sibling
+	// function: it runs once per struct per record, and extracting it measured
+	// ~5% slower on BenchmarkShredCaseInsensitive for the extra call. Nothing
+	// needs it callable on its own — TestShredStructPathsAgree compares the two
+	// paths through the public Shred entry point, using a shredder of each kind.
+	//
+	// Build an index of input keys by their match-key (the original key in
+	// case-sensitive mode, or its lowercase form in case-insensitive mode).
+	// In case-insensitive mode, multiple input keys may collide on the same
+	// match-key — we detect that as ambiguity rather than silently picking
+	// one. In case-sensitive mode, collisions are impossible because Go map
+	// keys are themselves case-sensitive.
+	keysByLookup := make(map[string][]string, len(value))
+	for k := range value {
+		mk := rs.matchKey(k)
+		keysByLookup[mk] = append(keysByLookup[mk], k)
+	}
+
+	// Track which input keys matched a schema field; remaining keys are
+	// candidates for new-field detection.
+	matched := make(map[string]struct{}, len(fields))
+
+	for _, field := range fields {
+		candidates := keysByLookup[rs.matchKey(field.Name)]
+		// If the input contains multiple keys that all map to the same schema
+		// field (only possible in case-insensitive mode), we cannot pick one
+		// without silently dropping data — refuse rather than guess.
+		if len(candidates) > 1 {
+			return fmt.Errorf("ambiguous case for field %q: input has %d keys differing only in case: %v", field.Name, len(candidates), candidates)
+		}
+
+		var (
+			fieldValue any
+			exists     bool
+		)
+		if len(candidates) == 1 {
+			fieldValue = value[candidates[0]]
+			exists = true
+			matched[candidates[0]] = struct{}{}
+		}
+
+		// Validate required fields.
+		if field.Required && (!exists || fieldValue == nil) {
+			return &RequiredFieldNullError{field, path}
+		}
+
+		// Compute this field's definition level contribution.
+		fieldDefLevel := defLevel
+		if !field.Required {
+			fieldDefLevel++ // Optional field adds to max def level.
+		}
+
+		// Build path for this field using the schema's casing so downstream
+		// consumers see canonical names regardless of the input's casing.
+		fieldPath := append(path, icebergx.PathSegment{Kind: icebergx.PathField, Name: field.Name})
+
+		if !exists || fieldValue == nil {
+			// Field is null or missing - emit null for all leaf descendants.
+			if err := rs.shredNull(field.Type, field.ID, repLevel, defLevel, sink); err != nil {
+				return err
+			}
+			continue
+		}
+
+		// Field is defined - process based on type.
+		if err := rs.shredValue(field.Type, field.ID, fieldValue, fieldPath, repLevel, fieldDefLevel, maxRepLevel, sink); err != nil {
+			return fmt.Errorf("field %q: %w", field.Name, err)
+		}
+	}
+
+	// Detect unknown fields in input.
+	for key, val := range value {
+		if _, ok := matched[key]; !ok {
+			sink.OnNewField(slices.Clone(path), key, val)
+		}
+	}
+
+	return nil
+}
+
+// shredStructExact is shredStruct's case-sensitive equivalent: input keys must
+// match schema field names byte-for-byte, so a field's value is just
+// value[field.Name] and case-collision ambiguity is impossible (Go map keys are
+// themselves case-sensitive).
+//
+// It must stay behaviourally identical to the general path for case-sensitive
+// shredders — same required-field errors, same null handling, same
+// OnNewField notifications, same traversal order of fields.
+func (rs *RecordShredder) shredStructExact(
+	fields []iceberg.NestedField,
+	value map[string]any,
+	path icebergx.Path,
+	repLevel, defLevel, maxRepLevel int,
+	sink Sink,
+) error {
+	// Count how many input keys were claimed by a schema field, so unknown-field
+	// detection below can usually be skipped without tracking a set.
+	matchedKeys := 0
+
+	for _, field := range fields {
+		fieldValue, exists := value[field.Name]
+		if exists {
+			matchedKeys++
+		}
+
+		// Validate required fields.
+		if field.Required && (!exists || fieldValue == nil) {
+			return &RequiredFieldNullError{field, path}
+		}
+
+		// Compute this field's definition level contribution.
+		fieldDefLevel := defLevel
+		if !field.Required {
+			fieldDefLevel++ // Optional field adds to max def level.
+		}
+
+		// Build path for this field. The schema's casing is the input's casing
+		// here, so no canonicalisation is needed.
+		fieldPath := append(path, icebergx.PathSegment{Kind: icebergx.PathField, Name: field.Name})
+
+		if !exists || fieldValue == nil {
+			// Field is null or missing - emit null for all leaf descendants.
+			if err := rs.shredNull(field.Type, field.ID, repLevel, defLevel, sink); err != nil {
+				return err
+			}
+			continue
+		}
+
+		if err := rs.shredValue(field.Type, field.ID, fieldValue, fieldPath, repLevel, fieldDefLevel, maxRepLevel, sink); err != nil {
+			return fmt.Errorf("field %q: %w", field.Name, err)
+		}
+	}
+
+	// Detect unknown fields in input. When field names are unique within a
+	// struct, each matched field claimed exactly one distinct input key, so
+	// agreeing counts mean every key is accounted for and there is nothing to
+	// report — the steady state once a schema has stabilised, and what makes the
+	// common case allocation-free. (A count above len(value) is harmless: it
+	// falls through to the scan.)
+	//
+	// Duplicate field names break that reasoning, because matchedKeys counts
+	// fields rather than distinct keys: fields [a, a] against {"a":1,"b":2}
+	// reaches 2 == 2 while "b" is genuinely unknown. Iceberg permits duplicate
+	// names, so the shortcut is disabled for such schemas rather than assumed
+	// away.
+	if !rs.duplicateFieldNames && matchedKeys == len(value) {
+		return nil
+	}
+
+	// Something is unknown: pay for a lookup set now, on the rare path only.
+	known := make(map[string]struct{}, len(fields))
+	for _, field := range fields {
+		known[field.Name] = struct{}{}
+	}
+	for key, val := range value {
+		if _, ok := known[key]; !ok {
+			sink.OnNewField(slices.Clone(path), key, val)
+		}
+	}
+
+	return nil
+}
+
+// matchKey returns the lookup key used to compare an input record key against
+// a schema field name. In case-sensitive mode it is the identity; in
+// case-insensitive mode it folds to lowercase.
+func (rs *RecordShredder) matchKey(s string) string {
+	if rs.caseSensitive {
+		return s
+	}
+	return strings.ToLower(s)
+}
+
+// shredValue processes a value according to its schema type.
+// maxRepLevel is the maximum repetition level at the current nesting depth.
+func (rs *RecordShredder) shredValue(
+	typ iceberg.Type,
+	fieldID int,
+	value any,
+	path icebergx.Path,
+	repLevel, defLevel, maxRepLevel int,
+	sink Sink,
+) error {
+	switch t := typ.(type) {
+	case *iceberg.StructType:
+		mapVal, ok := value.(map[string]any)
+		if !ok {
+			return fmt.Errorf("expected map for struct type, got %T", value)
+		}
+		return rs.shredStruct(t.Fields(), mapVal, path, repLevel, defLevel, maxRepLevel, sink)
+
+	case *iceberg.ListType:
+		return rs.shredList(t, value, path, repLevel, defLevel, maxRepLevel, sink)
+
+	case *iceberg.MapType:
+		return rs.shredMap(t, value, path, repLevel, defLevel, maxRepLevel, sink)
+
+	default:
+		// Leaf/primitive type.
+		pqVal, err := convertLeafValue(value, typ, rs.commonForField(fieldID), rs.StrictTemporalMode)
+		if err != nil {
+			return err
+		}
+		return sink.EmitValue(ShreddedValue{
+			FieldID:  fieldID,
+			Value:    pqVal,
+			RepLevel: repLevel,
+			DefLevel: defLevel,
+		})
+	}
+}
+
+// shredList processes a list value.
+// maxRepLevel is the maximum repetition level from parent context.
+func (rs *RecordShredder) shredList(
+	listType *iceberg.ListType,
+	value any,
+	path icebergx.Path,
+	repLevel, defLevel, maxRepLevel int,
+	sink Sink,
+) error {
+	slice, ok := value.([]any)
+	if !ok {
+		return fmt.Errorf("expected slice for list type, got %T", value)
+	}
+
+	// This list adds one to the max repetition level.
+	listMaxRepLevel := maxRepLevel + 1
+
+	// Empty list is treated like null.
+	if len(slice) == 0 {
+		return rs.shredNull(listType.Element, listType.ElementID, repLevel, defLevel, sink)
+	}
+
+	// Element's definition level.
+	elemDefLevel := defLevel + 1
+	if !listType.ElementRequired {
+		elemDefLevel++
+	}
+
+	// Path for list elements.
+	elemPath := append(path, icebergx.PathSegment{Kind: icebergx.PathListElement})
+
+	for i, elem := range slice {
+		elemRepLevel := repLevel
+		if i > 0 {
+			// Subsequent elements get this list's max repetition level.
+			elemRepLevel = listMaxRepLevel
+		}
+
+		if elem == nil {
+			// Null element.
+			nullDefLevel := defLevel + 1 // List is defined, but element is null.
+			if err := rs.shredNull(listType.Element, listType.ElementID, elemRepLevel, nullDefLevel, sink); err != nil {
+				return err
+			}
+			continue
+		}
+
+		if err := rs.shredValue(listType.Element, listType.ElementID, elem, elemPath, elemRepLevel, elemDefLevel, listMaxRepLevel, sink); err != nil {
+			return fmt.Errorf("list element %d: %w", i, err)
+		}
+	}
+
+	return nil
+}
+
+// shredMap processes a map value.
+// maxRepLevel is the maximum repetition level from parent context.
+func (rs *RecordShredder) shredMap(
+	mapType *iceberg.MapType,
+	value any,
+	path []icebergx.PathSegment,
+	repLevel, defLevel, maxRepLevel int,
+	sink Sink,
+) error {
+	mapVal, ok := value.(map[string]any)
+	if !ok {
+		return fmt.Errorf("expected map for map type, got %T", value)
+	}
+
+	// Maps are repeated (like lists), so they add one to the max repetition level.
+	mapMaxRepLevel := maxRepLevel + 1
+
+	// Empty map is treated like null.
+	if len(mapVal) == 0 {
+		// Emit nulls for both key and value columns.
+		if err := rs.shredNull(mapType.KeyType, mapType.KeyID, repLevel, defLevel, sink); err != nil {
+			return err
+		}
+		return rs.shredNull(mapType.ValueType, mapType.ValueID, repLevel, defLevel, sink)
+	}
+
+	keyDefLevel := defLevel + 1
+	valueDefLevel := defLevel + 1
+	if !mapType.ValueRequired {
+		valueDefLevel++
+	}
+
+	// Path for map entries.
+	entryPath := append(path, icebergx.PathSegment{Kind: icebergx.PathMapEntry})
+
+	first := true
+	for k, v := range mapVal {
+		elemRepLevel := repLevel
+		if !first {
+			// Subsequent entries get this map's max repetition level.
+			elemRepLevel = mapMaxRepLevel
+		}
+		first = false
+
+		// Shred the key. Map keys are always leaf primitives, never time
+		// types, so the schema-metadata lookup never fires for them.
+		keyVal, err := convertLeafValue(k, mapType.KeyType, nil, false)
+		if err != nil {
+			return fmt.Errorf("map key: %w", err)
+		}
+		if err := sink.EmitValue(ShreddedValue{
+			FieldID:  mapType.KeyID,
+			Value:    keyVal,
+			RepLevel: elemRepLevel,
+			DefLevel: keyDefLevel,
+		}); err != nil {
+			return err
+		}
+
+		// Shred the value.
+		if v == nil {
+			nullDefLevel := defLevel + 1 // Map entry is defined but value is null.
+			if err := rs.shredNull(mapType.ValueType, mapType.ValueID, elemRepLevel, nullDefLevel, sink); err != nil {
+				return err
+			}
+		} else {
+			if err := rs.shredValue(mapType.ValueType, mapType.ValueID, v, entryPath, elemRepLevel, valueDefLevel, mapMaxRepLevel, sink); err != nil {
+				return fmt.Errorf("map value for key %q: %w", k, err)
+			}
+		}
+	}
+
+	return nil
+}
+
+// shredNull emits null values for all leaf descendants of a type.
+// This is called when an optional/repeated field is null/missing.
+func (rs *RecordShredder) shredNull(
+	typ iceberg.Type,
+	fieldID int,
+	repLevel, defLevel int,
+	sink Sink,
+) error {
+	switch t := typ.(type) {
+	case *iceberg.StructType:
+		// Recurse into struct fields to emit nulls for all leaves.
+		for _, field := range t.Fields() {
+			if err := rs.shredNull(field.Type, field.ID, repLevel, defLevel, sink); err != nil {
+				return err
+			}
+		}
+		return nil
+
+	case *iceberg.ListType:
+		return rs.shredNull(t.Element, t.ElementID, repLevel, defLevel, sink)
+
+	case *iceberg.MapType:
+		if err := rs.shredNull(t.KeyType, t.KeyID, repLevel, defLevel, sink); err != nil {
+			return err
+		}
+		return rs.shredNull(t.ValueType, t.ValueID, repLevel, defLevel, sink)
+
+	default:
+		// Leaf type - emit null value.
+		return sink.EmitValue(ShreddedValue{
+			FieldID:  fieldID,
+			Value:    parquet.NullValue(),
+			RepLevel: repLevel,
+			DefLevel: defLevel,
+		})
+	}
+}
+
+// convertLeafValue converts a Go value to a parquet.Value based on the
+// Iceberg type. common is the upstream schema.Common describing the same
+// column (or nil); when present it carries logical params consulted by the
+// time/date arms to interpret numeric inputs using the declared unit
+// instead of guessing. Without metadata, the converter accepts time.Time /
+// time.Duration directly and treats bare numerics as already-in-the-target
+// unit (microseconds for time, seconds for timestamp via bloblang
+// ValueAsTimestamp's default — preserves the pre-PR behavior).
+func convertLeafValue(value any, typ iceberg.Type, common *schema.Common, strictTemporal bool) (parquet.Value, error) {
+	if value == nil {
+		return parquet.NullValue(), nil
+	}
+
+	switch typ := typ.(type) {
+	case iceberg.BooleanType:
+		switch v := value.(type) {
+		case bool:
+			return parquet.BooleanValue(v), nil
+		default:
+			return parquet.NullValue(), fmt.Errorf("cannot convert %T to boolean", value)
+		}
+
+	case iceberg.Int32Type:
+		// Coerce-to-existing-column-type: when the iceberg column is INT
+		// but the upstream schema declares a temporal logical type (Date,
+		// TimeOfDay) the upstream value will be time.Time / time.Duration.
+		// Honour the schema's unit and emit the wire-equivalent integer.
+		// Strict mode (require_schema_metadata=true) disables this bridge
+		// and refuses the type disagreement loudly instead.
+		if n, ok := CoerceTemporalToNumeric(value, common); ok {
+			if strictTemporal {
+				return parquet.NullValue(), fmt.Errorf("int column received %T while schema metadata declares type %v; require_schema_metadata=true demands the existing column type match the schema metadata — recreate the table to migrate", value, common.Type)
+			}
+			// A Timestamp common's UnixMilli/Micros/Nanos far exceeds the
+			// int32 range, but the Int32Type arm is intended for Date /
+			// TimeOfDay coercions whose values do fit. Reject the
+			// schema/column mismatch loudly rather than silently
+			// truncating into a garbage year.
+			if n > math.MaxInt32 || n < math.MinInt32 {
+				return parquet.NullValue(), fmt.Errorf("int column received %T with schema metadata type %v; coerced value %d overflows int32 — the column should be BIGINT or the schema metadata is wrong", value, common.Type, n)
+			}
+			return parquet.Int32Value(int32(n)), nil
+		}
+		i, err := bloblang.ValueAsInt64(value)
+		if err != nil {
+			return parquet.NullValue(), err
+		}
+		// Range-check before narrowing: a bare int32(i) silently wraps
+		// (4294967297 would store 1), corrupting the stored value with no
+		// error anywhere.
+		if i > math.MaxInt32 || i < math.MinInt32 {
+			return parquet.NullValue(), fmt.Errorf("int (32-bit) column given value %d outside the int32 range [%d, %d]; values that size need a long (64-bit) column", i, math.MinInt32, math.MaxInt32)
+		}
+		return parquet.Int32Value(int32(i)), nil
+
+	case iceberg.Int64Type:
+		// Coerce-to-existing-column-type: see the Int32Type arm above. For
+		// BIGINT columns this is the load-bearing case — it is what lets a
+		// rolling upgrade of schema_registry_decode (which now emits
+		// time.Time for timestamp-millis with preserve_logical_types=true)
+		// keep writing to a pre-existing BIGINT column that pre-dates the
+		// metadata fix.
+		if n, ok := CoerceTemporalToNumeric(value, common); ok {
+			if strictTemporal {
+				return parquet.NullValue(), fmt.Errorf("bigint column received %T while schema metadata declares type %v; require_schema_metadata=true demands the existing column type match the schema metadata — recreate the table to migrate", value, common.Type)
+			}
+			return parquet.Int64Value(n), nil
+		}
+		if v, ok := value.(uint64); ok && v > math.MaxInt64 {
+			return parquet.NullValue(), fmt.Errorf("uint64 value %d exceeds int64 range", v)
+		}
+		i, err := bloblang.ValueAsInt64(value)
+		return parquet.Int64Value(i), err
+
+	case iceberg.Float32Type:
+		i, err := bloblang.ValueAsFloat32(value)
+		return parquet.FloatValue(i), err
+
+	case iceberg.Float64Type:
+		i, err := bloblang.ValueAsFloat64(value)
+		return parquet.DoubleValue(i), err
+
+	case iceberg.StringType:
+		v, err := bloblang.ValueAsBytes(value)
+		return parquet.ByteArrayValue(v), err
+
+	case iceberg.BinaryType:
+		v, err := bloblang.ValueAsBytes(value)
+		return parquet.ByteArrayValue(v), err
+
+	case iceberg.DateType:
+		return convertDate(value, common, strictTemporal)
+
+	case iceberg.TimeType:
+		// Iceberg TIME is microseconds since midnight. Accept time.Duration
+		// directly (the twmb/avro decode of time-millis/time-micros), and
+		// fall back to numeric input interpreted via the schema-declared
+		// unit when available.
+		return convertTime(value, common, strictTemporal)
+
+	case iceberg.TimestampType, iceberg.TimestampTzType:
+		// Iceberg TIMESTAMP / TIMESTAMPTZ are microseconds since epoch.
+		// time.Time inputs are unambiguous and used directly. For numeric
+		// inputs, prefer the schema's declared unit so that millis stays
+		// millis (instead of being interpreted as seconds and landing in
+		// year 56755).
+		return convertTimestamp(value, common, false, strictTemporal)
+
+	case iceberg.TimestampNsType, iceberg.TimestampTzNsType:
+		return convertTimestamp(value, common, true, strictTemporal)
+
+	case iceberg.UUIDType:
+		switch v := value.(type) {
+		case []byte:
+			id, err := uuid.FromBytes(v)
+			if err != nil {
+				return parquet.NullValue(), fmt.Errorf("invalid UUID bytes: %w", err)
+			}
+			return parquet.FixedLenByteArrayValue(id.Bytes()), nil
+		case string:
+			id, err := uuid.FromString(v)
+			if err != nil {
+				return parquet.NullValue(), fmt.Errorf("invalid UUID string: %w", err)
+			}
+			return parquet.FixedLenByteArrayValue(id.Bytes()), nil
+		default:
+			return parquet.NullValue(), fmt.Errorf("cannot convert %T to UUID", value)
+		}
+
+	case iceberg.DecimalType:
+		return convertToDecimal(value, typ)
+
+	case iceberg.FixedType:
+		// TODO: Validate length
+		switch v := value.(type) {
+		case []byte:
+			return parquet.FixedLenByteArrayValue(v), nil
+		default:
+			return parquet.NullValue(), fmt.Errorf("cannot convert %T to fixed", value)
+		}
+
+	default:
+		return parquet.NullValue(), fmt.Errorf("unsupported Iceberg type: %T", typ)
+	}
+}
+
+// convertToDecimal converts a Go value to a Parquet decimal value.
+// Decimal values are stored as big-endian two's complement byte arrays.
+func convertToDecimal(value any, dt iceberg.DecimalType) (parquet.Value, error) {
+	scale := dt.Scale()
+
+	var (
+		unscaled *big.Int
+		err      error
+	)
+
+	switch v := value.(type) {
+	case []byte:
+		expectedLen := parquetdecimal.ByteWidth(dt.Precision())
+		if len(v) != expectedLen {
+			return parquet.NullValue(), fmt.Errorf("decimal []byte length %d does not match expected %d for precision %d", len(v), expectedLen, dt.Precision())
+		}
+		return parquet.FixedLenByteArrayValue(v), nil
+	case float64:
+		if math.IsNaN(v) || math.IsInf(v, 0) {
+			return parquet.NullValue(), fmt.Errorf("cannot convert %v to decimal", v)
+		}
+		unscaled = floatToUnscaled(v, scale)
+	case float32:
+		if math.IsNaN(float64(v)) || math.IsInf(float64(v), 0) {
+			return parquet.NullValue(), fmt.Errorf("cannot convert %v to decimal", v)
+		}
+		unscaled = floatToUnscaled(float64(v), scale)
+	case int64:
+		unscaled = intToUnscaled(v, scale)
+	case int:
+		unscaled = intToUnscaled(int64(v), scale)
+	case int32:
+		unscaled = intToUnscaled(int64(v), scale)
+	case int16:
+		unscaled = intToUnscaled(int64(v), scale)
+	case int8:
+		unscaled = intToUnscaled(int64(v), scale)
+	case uint64:
+		unscaled = new(big.Int).Mul(new(big.Int).SetUint64(v), parquetdecimal.Pow10(scale))
+	case uint32:
+		unscaled = intToUnscaled(int64(v), scale)
+	case uint16:
+		unscaled = intToUnscaled(int64(v), scale)
+	case uint8:
+		unscaled = intToUnscaled(int64(v), scale)
+	case uint:
+		unscaled = new(big.Int).Mul(new(big.Int).SetUint64(uint64(v)), parquetdecimal.Pow10(scale))
+	case json.Number:
+		unscaled, err = jsonNumberToUnscaled(v, scale)
+		if err != nil {
+			return parquet.NullValue(), err
+		}
+	case string:
+		// Canonical decimal strings (the value contract for schema.Decimal
+		// fields) are parsed exactly via schema.ParseDecimal. Fall back to
+		// the big.Float path for non-canonical inputs (scientific notation,
+		// leading +, etc.) that legacy callers may still produce.
+		if n, perr := schema.ParseDecimal(v, int32(scale)); perr == nil {
+			unscaled = n
+		} else if unscaled, err = stringToUnscaled(v, scale); err != nil {
+			return parquet.NullValue(), err
+		}
+	default:
+		return parquet.NullValue(), fmt.Errorf("cannot convert %T to decimal", value)
+	}
+
+	// Validate that the unscaled value fits within the declared precision.
+	// An out-of-range value would produce a valid Parquet file but violate the
+	// Iceberg schema contract, causing downstream query failures or wrong results.
+	maxUnscaled := parquetdecimal.Pow10(dt.Precision())
+	if unscaled.CmpAbs(maxUnscaled) >= 0 {
+		return parquet.NullValue(), fmt.Errorf("value %v exceeds decimal(%d, %d) precision", value, dt.Precision(), dt.Scale())
+	}
+
+	b := parquetdecimal.EncodeBytes(unscaled, dt.Precision())
+	return parquet.FixedLenByteArrayValue(b), nil
+}
+
+// DecimalNumberToString canonicalises a decimal supplied as text (a string or
+// json.Number) to the column's exact scale, using the SAME parse-and-round the
+// insert path's convertToDecimal applies (stringToUnscaled) so both sides
+// agree by construction. Exported for the mutation paths' shared leaf encoder:
+// every spelling of one decimal ("1.5", "1.50", float 1.5) must canonicalise
+// to one form, or the in-batch key collapse treats equal keys as distinct.
+func DecimalNumberToString(s string, prec, scale int) (string, error) {
+	unscaled, err := stringToUnscaled(s, scale)
+	if err != nil {
+		return "", err
+	}
+	if unscaled.CmpAbs(parquetdecimal.Pow10(prec)) >= 0 {
+		return "", fmt.Errorf("value %v exceeds decimal(%d, %d) precision", s, prec, scale)
+	}
+	return new(big.Rat).SetFrac(unscaled, parquetdecimal.Pow10(scale)).FloatString(scale), nil
+}
+
+// DecimalFloatToString renders a float64 as the decimal string whose parsed
+// unscaled value is EXACTLY what the shredder's insert path stores for the same
+// float in a decimal(prec, scale) column. It is built on floatToUnscaled — the
+// very conversion convertToDecimal applies — so parity holds by construction,
+// including the half-AWAY-from-zero tie rounding (0.125 at scale 2 renders as
+// "0.13", matching the stored unscaled 13; strconv.FormatFloat's half-to-even
+// would render "0.12" and silently diverge on every exact binary tie). It
+// mirrors convertToDecimal's NaN/±Inf rejection and precision validation, so an
+// input the insert path refuses is refused here too.
+//
+// Exported for the iceberg output's mutation paths (copy-on-write rewrite,
+// equality-delete keys), which encode values as JSON strings and must agree
+// byte-for-byte with what inserts store.
+func DecimalFloatToString(f float64, prec, scale int) (string, error) {
+	if math.IsNaN(f) || math.IsInf(f, 0) {
+		return "", fmt.Errorf("cannot convert %v to decimal", f)
+	}
+	unscaled := floatToUnscaled(f, scale)
+	if unscaled.CmpAbs(parquetdecimal.Pow10(prec)) >= 0 {
+		return "", fmt.Errorf("value %v exceeds decimal(%d, %d) precision", f, prec, scale)
+	}
+	// The fraction is exact (denominator 10^scale), so FloatString performs no
+	// rounding of its own.
+	return new(big.Rat).SetFrac(unscaled, parquetdecimal.Pow10(scale)).FloatString(scale), nil
+}
+
+// floatToUnscaled converts a float64 to an unscaled big.Int by multiplying by 10^scale.
+// Precision is capped at 128 bits which exceeds float64's 53-bit mantissa (~15.9 decimal
+// digits), so no additional precision loss occurs beyond what the float64 input already has.
+func floatToUnscaled(f float64, scale int) *big.Int {
+	bf := new(big.Float).SetPrec(128).SetFloat64(f)
+	scaleFactor := new(big.Float).SetPrec(128).SetInt(parquetdecimal.Pow10(scale))
+	bf.Mul(bf, scaleFactor)
+	if f < 0 {
+		bf.Sub(bf, new(big.Float).SetFloat64(0.5))
+	} else {
+		bf.Add(bf, new(big.Float).SetFloat64(0.5))
+	}
+	result, _ := bf.Int(nil)
+	return result
+}
+
+func intToUnscaled(i int64, scale int) *big.Int {
+	return new(big.Int).Mul(big.NewInt(i), parquetdecimal.Pow10(scale))
+}
+
+func jsonNumberToUnscaled(n json.Number, scale int) (*big.Int, error) {
+	if i, err := n.Int64(); err == nil {
+		return intToUnscaled(i, scale), nil
+	}
+	// Fall back to string parsing instead of Float64() to avoid the 53-bit
+	// mantissa precision loss on large integers or high-precision decimals.
+	return stringToUnscaled(n.String(), scale)
+}
+
+func stringToUnscaled(s string, scale int) (*big.Int, error) {
+	bf, _, err := new(big.Float).SetPrec(256).Parse(s, 10)
+	if err != nil {
+		return nil, fmt.Errorf("cannot parse %q as decimal: %w", s, err)
+	}
+	scaleFactor := new(big.Float).SetPrec(256).SetInt(parquetdecimal.Pow10(scale))
+	bf.Mul(bf, scaleFactor)
+	if bf.Sign() < 0 {
+		bf.Sub(bf, new(big.Float).SetFloat64(0.5))
+	} else {
+		bf.Add(bf, new(big.Float).SetFloat64(0.5))
+	}
+	result, _ := bf.Int(nil)
+	return result, nil
+}

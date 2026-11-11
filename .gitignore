@@ -1,0 +1,33 @@
+bin
+target
+vendor
+site
+.tags
+.DS_Store
+TODO.md
+release_notes.md
+.codemogger
+.idea
+.integration
+.task
+.vscode
+.op
+__pycache__
+*.test
+*.test.exe
+compile_out.txt
+test_output.txt
+internal/impl/saphana/bench/ngdbc.jar
+benchmark_results.json
+# Enterprise license files must never reach the (public) repo.
+*.license
+# Generated reference docs. Releases attach them as redpanda-connect-docs.tar.gz.
+/docs/modules/
+
+# Real Snowflake integration-test credentials (see internal/impl/snowflake/README.md).
+# Not the same as internal/impl/snowflake/resources/ssh_keys/snowflake_rsa_key.p8, which
+# is a throwaway fixture key deliberately committed elsewhere -- these are root-level
+# working-tree filenames only, and won't hide anything already tracked.
+/rsa_key.p8
+/rsa_key.pub
+/testing.env

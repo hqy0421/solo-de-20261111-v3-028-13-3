@@ -1,0 +1,181 @@
+// Copyright 2026 Redpanda Data, Inc.
+//
+// Licensed as a Redpanda Enterprise file under the Redpanda Community
+// License (the "License"); you may not use this file except in compliance with
+// the License. You may obtain a copy of the License at
+//
+// https://github.com/redpanda-data/connect/blob/main/licenses/rcl.md
+
+// Package jira provides a Benthos jiraProcessor that integrates with the Jira API
+// to fetch data based on input messages. It allows querying Jira resources
+// such as issues, projects, users, roles, transitions, and more.
+//
+// The jiraProcessor is configured with Jira connection details (base URL, user
+// credentials, API token) along with query and pagination options. Each input
+// message is parsed into a Jira query, which is then executed against the Jira
+// Search API or related resource APIs.
+//
+// The jiraProcessor handles pagination, retries, and optional field expansion in
+// order to make working with Jira's API more convenient inside message-oriented
+// workflows.
+package jira
+
+import (
+	"context"
+	"errors"
+
+	"github.com/redpanda-data/connect/v4/internal/httpclient"
+	"github.com/redpanda-data/connect/v4/internal/impl/jira/jiraauth"
+	"github.com/redpanda-data/connect/v4/internal/impl/jira/jirahttp"
+	"github.com/redpanda-data/connect/v4/internal/license"
+
+	"github.com/redpanda-data/benthos/v4/public/service"
+)
+
+// jiraProcessor is the Benthos jiraProcessor implementation for Jira queries.
+// It holds the client state and orchestrates calls into the jirahttp package.
+type jiraProcessor struct {
+	log    *service.Logger
+	client *jirahttp.Client
+}
+
+// newJiraProcessorConfigSpec creates a new Configuration specification for the Jira processor.
+func newJiraProcessorConfigSpec() *service.ConfigSpec {
+	spec := service.NewConfigSpec().
+		Categories("Services").
+		Version("4.68.0").
+		Deprecated().
+		Summary("Queries Jira resources and returns structured data.").
+		Description(`Executes Jira API queries based on input messages and returns structured results. The processor handles pagination, retries, and field expansion automatically.
+
+Since version 4.100.0, this processor is deprecated in favour of the xref:components:inputs/jira.adoc[`+"`jira` input"+`], which streams issues, comments, and changelog entries with cursor-based incremental polling. The processor remains available for enrichment and lookup style operations.
+
+Supports querying the following Jira resources:
+
+- Issues (JQL queries)
+- Issue transitions
+- Users
+- Roles
+- Project versions
+- Project categories
+- Project types
+- Projects
+
+Set `+"`base_url`"+` to the URL of your Jira instance, for example `+"`https://your-domain.atlassian.net`"+`. The processor authenticates using basic authentication with username and API token. Input messages should contain valid Jira queries in JSON format.`).
+		Example(
+			"Minimal configuration",
+			"Basic Jira processor setup with required fields only",
+			`
+pipeline:
+  processors:
+    - jira:
+        base_url: "https://your-domain.atlassian.net"
+        username: "${JIRA_USERNAME}"
+        api_token: "${JIRA_API_TOKEN}"
+`).
+		Example(
+			"Full configuration with tuning",
+			"Complete configuration with pagination and timeout settings",
+			`
+pipeline:
+  processors:
+    - jira:
+        base_url: "https://your-domain.atlassian.net"
+        username: "${JIRA_USERNAME}"
+        api_token: "${JIRA_API_TOKEN}"
+        max_results_per_page: 200
+        timeout: "30s"
+`).
+		Field(service.NewStringField("username").
+			Description("The username or email address of the Jira account.")).
+		Field(service.NewStringField("api_token").
+			Description("The Jira API token for the specified account. You can generate an API token from your https://id.atlassian.com/manage-profile/security/api-tokens[Atlassian account settings^].").
+			Secret()).
+		Field(service.NewIntField("max_results_per_page").
+			Description("The maximum number of results to return per page when calling the Jira API. https://docs.atlassian.com/software/jira/docs/api/REST/9.17.0/#pagination[Pagination^] in the Jira API is zero-based, so the first page starts at `0`.").
+			Default(50))
+
+	spec.Fields(httpclient.FieldsWithBaseURL("")...)
+
+	return spec
+}
+
+// newJiraProcessor initializes and returns a jiraProcessor instance based
+// on the provided Benthos configuration and resource manager. It validates
+// the configuration values, sets up the Jira HTTP client, and ensures that
+// an enterprise license is active before creating the processor.
+func newJiraProcessor(conf *service.ParsedConfig, mgr *service.Resources) (*jiraProcessor, error) {
+	if err := license.CheckRunningEnterprise(mgr); err != nil {
+		return nil, err
+	}
+
+	httpCfg, err := httpclient.NewConfigFromParsed(conf)
+	if err != nil {
+		return nil, err
+	}
+
+	username, err := conf.FieldString("username")
+	if err != nil {
+		return nil, err
+	}
+
+	apiToken, err := conf.FieldString("api_token")
+	if err != nil {
+		return nil, err
+	}
+
+	maxResults, err := conf.FieldInt("max_results_per_page")
+	if err != nil {
+		return nil, err
+	}
+	if maxResults <= 0 || maxResults > 5000 {
+		return nil, errors.New("max_results_per_page must be between 1 and 5000")
+	}
+
+	client, err := jiraauth.BuildClient(mgr, &httpCfg, username, apiToken, maxResults)
+	if err != nil {
+		return nil, err
+	}
+
+	return &jiraProcessor{
+		client: client,
+		log:    mgr.Logger(),
+	}, nil
+}
+
+func (j *jiraProcessor) Process(ctx context.Context, msg *service.Message) (service.MessageBatch, error) {
+	inputMsg, err := msg.AsBytes()
+	if err != nil {
+		return nil, err
+	}
+	j.log.Debugf("Fetching from Jira.. Input: %s", string(inputMsg))
+
+	inputQuery, err := j.client.ExtractQueryFromMessage(msg)
+	if err != nil {
+		return nil, err
+	}
+
+	resource, customFields, params, err := j.client.PrepareJiraQuery(ctx, inputQuery)
+	if err != nil {
+		return nil, err
+	}
+
+	return j.searchResource(ctx, resource, inputQuery, customFields, params)
+}
+
+// Close shuts down the Jira processor.
+func (*jiraProcessor) Close(context.Context) error {
+	return nil
+}
+
+// init registers the Jira processor with Benthos, wiring its configuration spec and constructor.
+func init() {
+	if err := service.RegisterProcessor(
+		"jira", newJiraProcessorConfigSpec(),
+		func(conf *service.ParsedConfig, mgr *service.Resources) (service.Processor, error) {
+			return newJiraProcessor(conf, mgr)
+		},
+	); err != nil {
+		panic(err)
+	}
+}

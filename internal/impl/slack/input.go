@@ -1,0 +1,150 @@
+// Copyright 2025 Redpanda Data, Inc.
+//
+// Licensed as a Redpanda Enterprise file under the Redpanda Community
+// License (the "License"); you may not use this file except in compliance with
+// the License. You may obtain a copy of the License at
+//
+// https://github.com/redpanda-data/connect/blob/main/licenses/rcl.md
+
+package slack
+
+import (
+	"context"
+	"errors"
+	"fmt"
+
+	"github.com/Jeffail/shutdown"
+	"github.com/slack-go/slack"
+	"github.com/slack-go/slack/socketmode"
+
+	"github.com/redpanda-data/benthos/v4/public/service"
+)
+
+func init() {
+	service.MustRegisterInput("slack", inputSpec(), newInput)
+}
+
+const (
+	iFieldAppToken = "app_token"
+	iFieldBotToken = "bot_token"
+)
+
+func inputSpec() *service.ConfigSpec {
+	return service.NewConfigSpec().
+		Version("4.51.0").
+		Summary("Connects to Slack using Socket Mode and receives events, interactions, and slash commands.").
+		Description(`This input connects to Slack using https://api.slack.com/apis/socket-mode[Socket Mode^]. Use it to build bots that respond to Slack activity, or to stream Slack events into other systems, such as a data warehouse.
+
+== Metadata
+
+This input adds the following metadata fields to each message:
+
+- `+"`type`"+`: The Socket Mode event type: `+"`events_api`"+`, `+"`interactive`"+`, or `+"`slash_commands`"+`.`).
+		Fields(
+			service.NewStringField(iFieldAppToken).Description("The app-level token, which starts with `xapp-`. The input uses it to open the Socket Mode connection, so it needs the https://api.slack.com/scopes/connections:write[`connections:write` scope^].").LintRule(`
+        root = if !this.has_prefix("xapp-") { [ "field must start with xapp-" ] }
+      `),
+			service.NewStringField(iFieldBotToken).Description("The OAuth token of your Slack bot user, which starts with `xoxb-`.").LintRule(`
+        root = if !this.has_prefix("xoxb-") { [ "field must start with xoxb-" ] }
+      `),
+			service.NewAutoRetryNacksToggleField(),
+		).
+		Example(echobotExample())
+}
+
+func newInput(conf *service.ParsedConfig, res *service.Resources) (service.Input, error) {
+	appToken, err := conf.FieldString(iFieldAppToken)
+	if err != nil {
+		return nil, err
+	}
+	botToken, err := conf.FieldString(iFieldBotToken)
+	if err != nil {
+		return nil, err
+	}
+	return service.AutoRetryNacksToggled(conf, &input{
+		appToken: appToken,
+		botToken: botToken,
+		log:      res.Logger(),
+	})
+}
+
+type input struct {
+	appToken string
+	botToken string
+	log      *service.Logger
+
+	shutSig *shutdown.Signaller
+	client  *socketmode.Client
+}
+
+func (i *input) Connect(context.Context) error {
+	api := slack.New(i.botToken, slack.OptionAppLevelToken(i.appToken))
+	client := socketmode.New(api)
+	shutSig := shutdown.NewSignaller()
+	go func() {
+		defer shutSig.TriggerHasStopped()
+		ctx, cancel := shutSig.HardStopCtx(context.Background())
+		defer cancel()
+		if err := client.RunContext(ctx); !errors.Is(err, ctx.Err()) {
+			i.log.Warnf("error running: %v", err)
+		}
+	}()
+	i.client = client
+	i.shutSig = shutSig
+	return nil
+}
+
+func (i *input) Read(ctx context.Context) (*service.Message, service.AckFunc, error) {
+	for {
+		select {
+		case evt, ok := <-i.client.Events:
+			if !ok {
+				return nil, nil, service.ErrNotConnected
+			}
+			switch evt.Type {
+			case socketmode.EventTypeConnected,
+				socketmode.EventTypeConnecting:
+				i.log.Debugf("%v to slack", evt.Type)
+				continue
+			case socketmode.EventTypeInvalidAuth,
+				socketmode.EventTypeConnectionError,
+				socketmode.EventTypeIncomingError,
+				socketmode.EventTypeErrorBadMessage,
+				socketmode.EventTypeErrorWriteFailed:
+				return nil, nil, fmt.Errorf("unexpected error event to slack: %v", evt.Type)
+			case socketmode.EventTypeHello, socketmode.EventTypeDisconnect:
+				i.log.Debugf("%v message from slack", evt.Type)
+				continue
+			case socketmode.EventTypeEventsAPI,
+				socketmode.EventTypeInteractive,
+				socketmode.EventTypeSlashCommand:
+				// These are the messages we want and need to ack
+			}
+			msg := service.NewMessage(evt.Request.Payload)
+			msg.MetaSetMut("type", string(evt.Type))
+			return msg, func(ctx context.Context, _ error) error {
+				if i.client == nil {
+					return nil
+				}
+				return i.client.AckCtx(ctx, evt.Request.EnvelopeID, nil)
+			}, nil
+		case <-ctx.Done():
+			return nil, nil, ctx.Err()
+		case <-i.shutSig.HasStoppedChan():
+			return nil, nil, service.ErrNotConnected
+		}
+	}
+}
+
+func (i *input) Close(ctx context.Context) error {
+	if i.client == nil {
+		return nil
+	}
+	i.shutSig.TriggerHardStop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-i.shutSig.HasStoppedChan():
+		return nil
+	}
+}

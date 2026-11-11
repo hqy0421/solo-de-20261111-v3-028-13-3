@@ -1,0 +1,1698 @@
+// Copyright 2025 Redpanda Data, Inc.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//    http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package migrator
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"iter"
+	"maps"
+	"math/rand/v2"
+	"net/http"
+	"regexp"
+	"slices"
+	"sort"
+	"strconv"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"time"
+
+	"github.com/google/go-cmp/cmp"
+	"github.com/google/go-cmp/cmp/cmpopts"
+	"golang.org/x/sync/errgroup"
+
+	"github.com/redpanda-data/benthos/v4/public/service"
+	"github.com/redpanda-data/connect/v4/internal/confx"
+
+	"github.com/twmb/franz-go/pkg/sr"
+)
+
+// Versions represents which schema versions to migrate
+type Versions string
+
+// Supported versions
+const (
+	VersionsLatest Versions = "latest"
+	VersionsAll    Versions = "all"
+)
+
+// String returns the string representation of the versions setting
+func (v Versions) String() string {
+	return string(v)
+}
+
+// ParseVersions parses a string into a Versions setting
+func ParseVersions(s string) (Versions, error) {
+	switch s {
+	case string(VersionsLatest):
+		return VersionsLatest, nil
+	case string(VersionsAll):
+		return VersionsAll, nil
+	default:
+		return "", fmt.Errorf("invalid versions setting: %s", s)
+	}
+}
+
+const (
+	srObjectField = "schema_registry"
+
+	// Schema registry fields
+	srFieldURL     = "url"
+	srFieldTimeout = "timeout"
+	srFieldTLS     = "tls"
+
+	// Schema registry migrator fields
+	srFieldEnabled                = "enabled"
+	srFieldInterval               = "interval"
+	srFieldInclude                = "include"
+	srFieldExclude                = "exclude"
+	srFieldSubject                = "subject"
+	srFieldVersions               = "versions"
+	srFieldIncludeDeleted         = "include_deleted"
+	srFieldTranslateIDs           = "translate_ids"
+	srFieldNormalize              = "normalize"
+	srFieldMaxParallelHTTPRequest = "max_parallel_http_requests"
+	srFieldStrict                 = "strict"
+)
+
+func schemaRegistryField(extraFields ...*service.ConfigField) *service.ConfigField {
+	fields := append(
+		[]*service.ConfigField{
+			service.NewStringField(srFieldURL).
+				Description("The base URL of the schema registry service. Required for schema migration functionality.").
+				Example("http://localhost:8081").
+				Example("https://schema-registry.example.com:8081"),
+			service.NewDurationField(srFieldTimeout).
+				Description("HTTP client timeout for schema registry requests.").Version("4.72.0").
+				Default("5s").
+				Optional(),
+			service.NewTLSToggledField(srFieldTLS),
+		},
+		service.NewHTTPRequestAuthSignerFields()...)
+	fields = append(fields, extraFields...)
+
+	return service.NewObjectField(srObjectField, fields...).
+		Description("Configuration for schema registry integration. Enables migration of schema subjects, versions, and compatibility settings between clusters.").
+		ShortDescription("Configuration for schema registry integration, enabling migration of subjects, versions and compatibility settings.")
+}
+
+func schemaRegistryMigratorFields() []*service.ConfigField {
+	return []*service.ConfigField{
+		service.NewBoolField(srFieldEnabled).
+			Description("Whether schema registry migration is enabled. When disabled, no schema operations are performed.").
+			Default(true),
+		service.NewDurationField(srFieldInterval).
+			Description("How often to synchronise schema registry subjects. Subjects that fail to sync are logged and retried on the next sync. Set to 0s for one-time sync at startup only, in which case only the subjects that failed are retried, with backoff, until they sync. " +
+				"With translate_ids enabled, a record encoded with a schema that failed to sync blocks the output until the schema is synced.").
+			Example("0s     # One-time sync only").
+			Example("5m     # Sync every 5 minutes").
+			Example("30m    # Sync every 30 minutes").
+			Default("5m"),
+		service.NewStringListField(srFieldInclude).
+			Description("Regular expressions for schema subjects to include in migration. " +
+				"If empty, all subjects are included (unless excluded). " +
+				"Note: the migrator consumer group is always ignored.").
+			ShortDescription("Regular expressions for schema subjects to include in migration. All subjects are included if empty.").
+			Example([]any{"prod-.*", "staging-.*"}).
+			Example([]any{"user-.*", "order-.*"}).
+			Optional(),
+		service.NewStringListField(srFieldExclude).
+			Description("Regular expressions for schema subjects to exclude from migration. " +
+				"Takes precedence over include patterns. " +
+				"Note: the migrator consumer group is always ignored.").
+			ShortDescription("Regular expressions for schema subjects to exclude from migration. Takes precedence over include.").
+			Example([]any{".*-test", ".*-temp"}).
+			Example([]any{"dev-.*", "local-.*"}).
+			Optional(),
+		service.NewInterpolatedStringField(srFieldSubject).
+			Description("Template for transforming subject names during migration. Use interpolation to rename subjects systematically.").
+			Example(`prod_${! metadata("schema_registry_subject") }`).
+			Example(`${! metadata("schema_registry_subject") | replace("dev_", "prod_") }`).
+			Optional(),
+		service.NewStringEnumField(srFieldVersions, VersionsLatest.String(), VersionsAll.String()).
+			Description("Which schema versions to migrate. 'latest' migrates only the current version, 'all' migrates complete version history for better compatibility.").
+			ShortDescription("Which schema versions to migrate: the latest only, or the complete version history.").
+			Default(VersionsAll.String()),
+		service.NewBoolField(srFieldIncludeDeleted).
+			Description("Whether to include soft-deleted schemas in migration. Useful for complete migration but may not be supported by all schema registries.").
+			ShortDescription("Whether to include soft-deleted schemas in migration. Not supported by all schema registries.").
+			Default(false),
+		service.NewBoolField(srFieldTranslateIDs).
+			Description("Whether to translate schema IDs during migration.").
+			Default(false),
+		service.NewBoolField(srFieldNormalize).
+			Description("Whether to normalize schemas when creating them in the destination registry.").
+			Default(false),
+		service.NewBoolField(srFieldStrict).
+			Description("Error on unknown schema IDs. Only relevant when translate_ids is true. " +
+				"When false (default), unknown schema IDs are passed through unchanged, " +
+				"allowing migration of topics with mixed message formats. " +
+				"IDs of schemas that failed to sync to the destination are always rejected, regardless of this setting, and the write is retried until a later sync registers the schema, or the source no longer has it. " +
+				"Since the output writes in order, this blocks the output until then. " +
+				"Note: messages with 0-byte prefixes (for example, protobuf) cannot be distinguished from schema registry headers and may fail when strict is enabled.").
+			ShortDescription("Error on unknown schema IDs. Only relevant when translate_ids is true.").
+			Default(false),
+		service.NewIntField(srFieldMaxParallelHTTPRequest).
+			Description("Maximum number of parallel HTTP requests to the schema registry. Controls concurrency when syncing multiple schemas.").Version("4.80.0").
+			Default(10).
+			LintRule(`root = if this < 1 { "max_parallel_http_requests must be at least 1" }`),
+	}
+}
+
+func schemaRegistryClientAndURLFromParsed(pConf *service.ParsedConfig, mgr *service.Resources) (*sr.Client, string, error) {
+	if !pConf.Contains("schema_registry") {
+		return nil, "", nil
+	}
+	pConf = pConf.Namespace(srObjectField)
+
+	// If the enabled flag exists and is set to false, short-circuit without creating a client.
+	if pConf.Contains(srFieldEnabled) {
+		enabled, err := pConf.FieldBool(srFieldEnabled)
+		if err != nil {
+			return nil, "", err
+		}
+		if !enabled {
+			return nil, "", nil
+		}
+	}
+
+	srURL, err := pConf.FieldURL(srFieldURL)
+	if err != nil {
+		return nil, "", err
+	}
+
+	timeout, err := pConf.FieldDuration(srFieldTimeout)
+	if err != nil {
+		return nil, "", err
+	}
+
+	reqSigner, err := pConf.HTTPRequestAuthSignerFromParsed()
+	if err != nil {
+		return nil, "", err
+	}
+
+	tlsConf, tlsEnabled, err := pConf.FieldTLSToggled(srFieldTLS)
+	if err != nil {
+		return nil, "", err
+	}
+	if !tlsEnabled {
+		tlsConf = nil
+	}
+
+	opts := []sr.ClientOpt{
+		sr.HTTPClient(&http.Client{Timeout: timeout}),
+		sr.UserAgent("franz-go"),
+		sr.URLs(srURL.String()),
+	}
+
+	if tlsConf != nil {
+		opts = append(opts, sr.DialTLSConfig(tlsConf))
+	}
+	if reqSigner != nil {
+		opts = append(opts, sr.PreReq(func(req *http.Request) error { return reqSigner(mgr.FS(), req) }))
+	}
+	client, err := sr.NewClient(opts...)
+	return client, srURL.String(), err
+}
+
+// SchemaRegistryMigratorConfig configures subject selection, transformation,
+// and copy behaviour for schema registry migration.
+type SchemaRegistryMigratorConfig struct {
+	// Enabled toggles schema registry migration.
+	Enabled bool
+	// Interval controls how often to synchronise schemas. Zero means one-shot.
+	Interval time.Duration
+	confx.RegexpFilter
+	// NameResolver sets per-subject names using an interpolated template.
+	NameResolver *service.InterpolatedString
+	// CompatibilityLevel sets per-subject compatibility level.
+	CompatibilityLevel *service.InterpolatedString
+	// Versions selects which schema versions to migrate (latest or all).
+	Versions Versions
+	// IncludeDeleted also copies soft-deleted subjects and marks them deleted
+	// in the target.
+	IncludeDeleted bool
+	// TranslateIDs enables schema ID translation during migration.
+	TranslateIDs bool
+	// Normalize toggles schema normalization on create.
+	Normalize bool
+	// Strict controls if DestinationSchemaID should error if the
+	// source schema ID is unknown.
+	Strict bool
+	// MaxParallelHTTPRequests controls the maximum number of concurrent HTTP requests
+	// to the schema registry.
+	MaxParallelHTTPRequests int
+	// Serverless narrows the set of schema configuration keys to those
+	// supported by serverless clusters.
+	Serverless bool
+
+	// TestingOnSetSubjectMode, when non-nil, is called every time
+	// the import mode manager changes a subject's mode (both set and restore).
+	// This field is only intended for use in tests.
+	TestingOnSetSubjectMode func(subject string, mode sr.Mode)
+}
+
+// initFromParsed initializes the schema registry migrator with configuration from parsed config.
+func (m *SchemaRegistryMigratorConfig) initFromParsed(pConf *service.ParsedConfig) error {
+	if !pConf.Contains("schema_registry") {
+		return nil
+	}
+
+	var err error
+
+	// Enabled flag
+	if m.Enabled, err = pConf.FieldBool(srObjectField, srFieldEnabled); err != nil {
+		return fmt.Errorf("parse enabled setting: %w", err)
+	}
+
+	// Parse interval
+	if m.Interval, err = pConf.FieldDuration(srObjectField, srFieldInterval); err != nil {
+		return fmt.Errorf("parse interval setting: %w", err)
+	}
+
+	// Parse include regex patterns
+	if pConf.Contains(srObjectField, srFieldInclude) {
+		patterns, err := pConf.FieldStringList(srObjectField, srFieldInclude)
+		if err != nil {
+			return fmt.Errorf("parse include patterns: %w", err)
+		}
+		m.Include, err = confx.ParseRegexpPatterns(patterns)
+		if err != nil {
+			return fmt.Errorf("invalid include regex patterns: %w", err)
+		}
+	}
+
+	// Parse exclude regex patterns
+	if pConf.Contains(srObjectField, srFieldExclude) {
+		patterns, err := pConf.FieldStringList(srObjectField, srFieldExclude)
+		if err != nil {
+			return fmt.Errorf("parse exclude patterns: %w", err)
+		}
+		m.Exclude, err = confx.ParseRegexpPatterns(patterns)
+		if err != nil {
+			return fmt.Errorf("invalid exclude regex patterns: %w", err)
+		}
+	}
+
+	// Parse subject transform
+	if pConf.Contains(srObjectField, srFieldSubject) {
+		if m.NameResolver, err = pConf.FieldInterpolatedString(srObjectField, srFieldSubject); err != nil {
+			return fmt.Errorf("parse subject transform: %w", err)
+		}
+	}
+
+	// Parse versions setting
+	{
+		var versionsStr string
+		if versionsStr, err = pConf.FieldString(srObjectField, srFieldVersions); err != nil {
+			return fmt.Errorf("parse versions setting: %w", err)
+		}
+		if m.Versions, err = ParseVersions(versionsStr); err != nil {
+			return fmt.Errorf("parse versions setting: %w", err)
+		}
+	}
+
+	// Parse boolean flags
+	if m.IncludeDeleted, err = pConf.FieldBool(srObjectField, srFieldIncludeDeleted); err != nil {
+		return fmt.Errorf("parse soft_delete setting: %w", err)
+	}
+	if m.TranslateIDs, err = pConf.FieldBool(srObjectField, srFieldTranslateIDs); err != nil {
+		return fmt.Errorf("parse translate_ids setting: %w", err)
+	}
+	if m.Normalize, err = pConf.FieldBool(srObjectField, srFieldNormalize); err != nil {
+		return fmt.Errorf("parse normalize setting: %w", err)
+	}
+	if m.MaxParallelHTTPRequests, err = pConf.FieldInt(srObjectField, srFieldMaxParallelHTTPRequest); err != nil {
+		return fmt.Errorf("parse max_parallel_http_requests setting: %w", err)
+	}
+	if m.Strict, err = pConf.FieldBool(srObjectField, srFieldStrict); err != nil {
+		return fmt.Errorf("parse strict setting: %w", err)
+	}
+
+	// Use serverless from migrator config
+	m.Serverless, err = pConf.FieldBool(rmoFieldServerless)
+	if err != nil {
+		return fmt.Errorf("get serverless field: %w", err)
+	}
+
+	return nil
+}
+
+type schemaSubjectVersion struct {
+	Subject string
+	Version int
+}
+
+func schemaSubjectVersionFromSubjectSchema(ss sr.SubjectSchema) schemaSubjectVersion {
+	return schemaSubjectVersion{
+		Subject: ss.Subject,
+		Version: ss.Version,
+	}
+}
+
+type schemaInfo struct {
+	Subject string
+	Version int
+	ID      int
+}
+
+// schemaRegistryMigrator coordinates migration between a source and destination
+// Schema Registry.
+//
+// Responsibilities:
+//   - Manage configuration and source/destination Schema Registry clients.
+//   - List and filter subjects (by include/exclude) and select versions to migrate.
+//   - Copy schemas to the destination (fixed IDs or translated IDs).
+//   - Apply per-subject compatibility on the destination.
+//   - Run one-off Sync and periodic SyncLoop.
+type schemaRegistryMigrator struct {
+	conf    SchemaRegistryMigratorConfig
+	src     *sr.Client
+	srcURL  string
+	dst     *sr.Client
+	dstURL  string
+	metrics *schemaRegistryMetrics
+	log     *service.Logger
+
+	mu            sync.RWMutex
+	knownSubjects map[schemaSubjectVersion]struct{} // source schema subject and version marked as known
+	schemas       map[int]schemaState               // source schema ID -> what is known about it
+	failedRoots   map[string]struct{}               // root subjects with a failure, retried at interval 0s
+	loopRunning   bool                              // a SyncLoop is running
+
+	// syncMu serializes syncs. The initial sync of an output reconnect may
+	// otherwise overlap the sync loop, and on serverless registries one sync
+	// can restore a subject's mode while another still imports into it.
+	syncMu sync.Mutex
+
+	// Backoff bounds for retrying failed subjects when interval is 0s.
+	retryMinBackoff time.Duration
+	retryMaxBackoff time.Duration
+}
+
+// schemaState is what the migrator knows about one source schema ID. err is
+// set while the schema is not registered at the destination, and info once it
+// is. A single map holds both, so that a lookup cannot observe the schema in
+// neither state while a sync registers it.
+type schemaState struct {
+	info schemaInfo // destination schema, once registered
+	err  error      // last sync error, while not registered
+
+	// Source subject version the state was recorded for, so that a sync can
+	// prune a failure that the source no longer has.
+	subject string
+	version int
+}
+
+// setSchemaSynced records the destination schema of s's schema ID.
+func (m *schemaRegistryMigrator) setSchemaSynced(s sr.SubjectSchema, info schemaInfo) {
+	m.mu.Lock()
+	m.schemas[s.ID] = schemaState{info: info, subject: s.Subject, version: s.Version}
+	m.mu.Unlock()
+}
+
+// setSchemaFailed records err for s's schema ID, unless the ID is already
+// registered, e.g. by another subject holding the same schema.
+func (m *schemaRegistryMigrator) setSchemaFailed(s sr.SubjectSchema, err error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if cur, ok := m.schemas[s.ID]; ok && cur.err == nil {
+		return
+	}
+	m.schemas[s.ID] = schemaState{err: err, subject: s.Subject, version: s.Version}
+}
+
+// ListSubjectSchemas returns a list of all source subject schemas Filtered by
+// the migrator configuration and sorted by the source schema ID.
+func (m *schemaRegistryMigrator) ListSubjectSchemas(ctx context.Context) ([]sr.SubjectSchema, error) {
+	if m.src == nil {
+		return nil, errors.New("source schema registry client not configured")
+	}
+
+	var schemas []sr.SubjectSchema
+	for ss, err := range m.listSubjectSchemas(ctx, m.src, m.conf.Versions, nil) {
+		if err != nil {
+			return nil, err
+		}
+		schemas = append(schemas, ss)
+	}
+
+	// Sort by schema ID ascending
+	sort.Slice(schemas, func(i, j int) bool {
+		return schemas[i].ID < schemas[j].ID
+	})
+
+	return schemas, nil
+}
+
+func (m *schemaRegistryMigrator) listSubjectSchemas(
+	ctx context.Context,
+	client *sr.Client,
+	versions Versions,
+	filter func(subject string, version int) bool,
+) iter.Seq2[sr.SubjectSchema, error] {
+	return func(yield func(sr.SubjectSchema, error) bool) {
+		if m.conf.IncludeDeleted {
+			ctx = sr.WithParams(ctx, sr.ShowDeleted)
+		}
+
+		// List and filter subjects
+		subs, err := client.Subjects(ctx)
+		if err != nil {
+			yield(sr.SubjectSchema{}, fmt.Errorf("list subjects: %w", err))
+			return
+		}
+		subs = m.conf.Filtered(subs)
+		rand.Shuffle(len(subs), func(i, j int) {
+			subs[i], subs[j] = subs[j], subs[i]
+		})
+
+		// Get and yield subject schemas
+		switch versions {
+		case VersionsLatest:
+			const latestVersion = -1
+			for _, s := range subs {
+				schema, err := client.SchemaByVersion(ctx, s, latestVersion)
+				if err != nil {
+					// Keep the subject so the caller can tell which one failed.
+					schema = sr.SubjectSchema{Subject: s}
+					err = fmt.Errorf("get latest schema for subject %q: %w", s, err)
+				}
+				if !yield(schema, err) {
+					return
+				}
+			}
+		case VersionsAll:
+			for _, s := range subs {
+				vers, err := client.SubjectVersions(ctx, s)
+				if err != nil {
+					if !yield(sr.SubjectSchema{}, fmt.Errorf("get versions for subject %q: %w", s, err)) {
+						return
+					}
+				}
+				sort.Ints(vers)
+
+				for _, v := range vers {
+					if filter != nil && filter(s, v) {
+						continue
+					}
+
+					schema, err := client.SchemaByVersion(ctx, s, v)
+					if err != nil {
+						err = fmt.Errorf("get schema for subject %q version %d: %w", s, v, err)
+					}
+					if !yield(schema, err) {
+						return
+					}
+				}
+			}
+		default:
+			yield(sr.SubjectSchema{}, fmt.Errorf("unsupported versions mode: %q", versions))
+		}
+	}
+}
+
+func (m *schemaRegistryMigrator) dfsSubjectSchemasFunc(
+	ctx context.Context,
+	client *sr.Client,
+	root sr.SubjectSchema,
+	filter func(subject string, version int) bool,
+	cb func(sr.SubjectSchema) error,
+) error {
+	if m.conf.IncludeDeleted {
+		ctx = sr.WithParams(ctx, sr.ShowDeleted)
+	}
+
+	type stackItem struct {
+		sr.SubjectSchema
+		fetched  bool // true when schema has been fetched from client
+		expanded bool // true when we've pushed dependencies and ready to process
+	}
+
+	var (
+		stack   = []stackItem{{SubjectSchema: root, fetched: true}}
+		visited = map[schemaSubjectVersion]struct{}{
+			schemaSubjectVersionFromSubjectSchema(root): {},
+		}
+	)
+
+	enqueue := func(subject string, version int) {
+		key := schemaSubjectVersion{Subject: subject, Version: version}
+		if _, ok := visited[key]; ok {
+			return
+		}
+		visited[key] = struct{}{}
+
+		if filter != nil && filter(subject, version) {
+			return
+		}
+
+		stack = append(stack, stackItem{
+			Subject: subject,
+			Version: version,
+		})
+	}
+
+	for len(stack) > 0 {
+		// Peek at top of stack and try to expand
+		item := &stack[len(stack)-1]
+
+		if !item.fetched {
+			ss, err := client.SchemaByVersion(ctx, item.Subject, item.Version)
+			if err != nil {
+				return fmt.Errorf("fetch schema %s version %d: %w", item.Subject, item.Version, err)
+			}
+			item.SubjectSchema, item.fetched = ss, true
+		}
+		if !item.expanded {
+			// Add previous versions if VersionsAll is enabled. Only versions
+			// below this one: later versions are reached from their subject's
+			// own root, and enqueuing them here would process them before this
+			// one.
+			if m.conf.Versions == VersionsAll && item.Version > 1 {
+				vers, err := client.SubjectVersions(ctx, item.Subject)
+				if err != nil {
+					return fmt.Errorf("get versions for subject %q: %w", item.Subject, err)
+				}
+				// Sort in descending order
+				slices.SortFunc(vers, func(a, b int) int {
+					return b - a
+				})
+				for _, v := range vers {
+					if v < item.Version {
+						enqueue(item.Subject, v)
+					}
+				}
+			}
+			// Add references
+			for _, ref := range item.References {
+				enqueue(ref.Subject, ref.Version)
+			}
+
+			// Mark as expanded and continue
+			item.expanded = true
+			continue
+		}
+
+		// Pop from stack and process
+		stack = stack[:len(stack)-1]
+		if err := cb(item.SubjectSchema); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+// SyncLoop runs the schema registry sync in a loop at the configured interval
+// until ctx is done. If interval is <= 0, the loop is not started, and only
+// the subjects that failed the initial sync are retried until they sync.
+//
+// SyncLoop is called on every output connect. While a loop is running, further
+// calls return immediately.
+func (m *schemaRegistryMigrator) SyncLoop(ctx context.Context) {
+	if !m.enabled() {
+		m.log.Info("Schema migration: schema registry sync disabled")
+		return
+	}
+
+	m.mu.Lock()
+	running := m.loopRunning
+	m.loopRunning = true
+	m.mu.Unlock()
+	if running {
+		m.log.Debug("Schema migration: schema registry sync loop already running")
+		return
+	}
+
+	if m.conf.Interval <= 0 {
+		m.log.Info("Schema migration: schema registry sync disabled (interval <= 0)")
+		m.retryFailed(ctx)
+		return
+	}
+	defer m.stopLoop()
+
+	m.log.Infof("Schema migration: starting schema registry sync loop every %s", m.conf.Interval)
+
+	t := time.NewTicker(m.conf.Interval)
+	defer t.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			m.log.Infof("Schema migration: stopping schema registry sync loop")
+			return
+		case <-t.C:
+			if err := m.Sync(ctx); err != nil {
+				m.log.Errorf("Schema migration: sync error: %v", err)
+			}
+		}
+	}
+}
+
+// retryFailed re-syncs the root subjects that failed the last sync, with
+// exponential backoff, until none fail or ctx is done. Without it, a subject
+// that failed the initial sync under interval 0s would never be retried, and
+// with translate_ids its records would block the output indefinitely. Only
+// the failed roots are synced, so subjects added at the source after the
+// initial sync are still not migrated.
+//
+// retryFailed ends the running loop on return. It checks for failed roots and
+// ends the loop under the same lock, so failures recorded by a sync that
+// finishes concurrently are left to a new loop rather than lost.
+func (m *schemaRegistryMigrator) retryFailed(ctx context.Context) {
+	backoff := m.retryMinBackoff
+	for {
+		m.mu.Lock()
+		roots := maps.Clone(m.failedRoots)
+		if len(roots) == 0 {
+			m.loopRunning = false
+			m.mu.Unlock()
+			return
+		}
+		m.mu.Unlock()
+
+		m.log.Infof("Schema migration: retrying %d failed subjects in %s", len(roots), backoff)
+		select {
+		case <-ctx.Done():
+			m.stopLoop()
+			return
+		case <-time.After(backoff):
+		}
+		if err := m.sync(ctx, roots); err != nil {
+			m.log.Errorf("Schema migration: sync error: %v", err)
+		} else {
+			m.log.Info("Schema migration: failed subjects synced")
+		}
+		backoff = min(2*backoff, m.retryMaxBackoff)
+	}
+}
+
+func (m *schemaRegistryMigrator) stopLoop() {
+	m.mu.Lock()
+	m.loopRunning = false
+	m.mu.Unlock()
+}
+
+// Sync syncs the source schema registry with the destination schema registry.
+// It lists all subject schemas in the source schema registry, filters them by
+// the migrator configuration, and then syncs each subject schema and its
+// compatibility mode.
+//
+// Subject versions that the destination registry rejects (e.g. an incompatible
+// schema) are logged and skipped, and Sync returns a *partialSyncError after
+// syncing the rest. Any other error means the sync could not run, e.g. an
+// unreachable, unauthorized or misconfigured registry.
+//
+// For serverless schema registries, it automatically handles IMPORT mode by
+// temporarily switching subject to IMPORT mode and restoring the original mode
+// after migration completes.
+func (m *schemaRegistryMigrator) Sync(ctx context.Context) error {
+	return m.sync(ctx, nil)
+}
+
+// sync implements Sync. If roots is not nil, only the root subjects in it are
+// synced, along with the versions and references they depend on.
+func (m *schemaRegistryMigrator) sync(ctx context.Context, roots map[string]struct{}) error {
+	if !m.enabled() {
+		m.log.Info("Schema migration: schema registry sync disabled")
+		return nil
+	}
+
+	m.syncMu.Lock()
+	defer m.syncMu.Unlock()
+
+	m.log.Info("Schema migration: syncing schema registry")
+
+	if err := m.validateSchemaRegistries(ctx); err != nil {
+		return err
+	}
+
+	if m.conf.MaxParallelHTTPRequests < 1 {
+		return errors.New("max_parallel_http_requests must be at least 1")
+	}
+
+	filter := func(subject string, version int) bool {
+		m.mu.RLock()
+		_, ok := m.knownSubjects[schemaSubjectVersion{
+			Subject: subject,
+			Version: version,
+		}]
+		m.mu.RUnlock()
+		return ok
+	}
+	loggingFilter := func(subject string, version int) bool {
+		ok := filter(subject, version)
+		if ok {
+			m.log.Debugf("Schema migration: schema already synced, skipping: subject=%s version=%d", subject, version)
+		}
+		return ok
+	}
+
+	modeMgr, err := m.newImportModeManager(ctx)
+	if err != nil {
+		return fmt.Errorf("create import mode manager: %w", err)
+	}
+	defer modeMgr.Close()
+
+	run := newSyncRun(m, roots)
+	workCh := make(chan sr.SubjectSchema, m.conf.MaxParallelHTTPRequests)
+	g, gctx := errgroup.WithContext(ctx)
+
+	// Producer: send root subjects to channel
+	g.Go(func() error {
+		defer close(workCh)
+		for ss, err := range m.listSubjectSchemas(gctx, m.src, VersionsLatest, loggingFilter) { // Always use latest for DFS roots
+			if ss.Subject != "" && !run.inScope(ss.Subject) {
+				continue
+			}
+			if err != nil {
+				// A subject removed from the source after it was listed
+				// fails only that subject.
+				if ss.Subject != "" && run.fail(gctx, ss, ss, err) == nil {
+					continue
+				}
+				return fmt.Errorf("list subject schemas: %w", err)
+			}
+			select {
+			case workCh <- ss:
+			case <-gctx.Done():
+				return gctx.Err()
+			}
+		}
+		return nil
+	})
+
+	// Workers: process subjects with DFS traversal
+	for range m.conf.MaxParallelHTTPRequests {
+		g.Go(func() error {
+			for ss := range workCh {
+				err := m.dfsSubjectSchemasFunc(gctx, m.src, ss, filter, func(s sr.SubjectSchema) error {
+					if run.skip(ss, s) {
+						return nil
+					}
+
+					m.log.Debugf("Schema migration: syncing subject=%s version=%d id=%d", s.Subject, s.Version, s.ID)
+
+					if err := modeMgr.TrySetImportMode(gctx, s); err != nil {
+						m.log.Warnf("Schema migration: failed to set IMPORT mode for subject %s: %v", s.Subject, err)
+					}
+					unlockID := run.lockID(s.ID)
+					info, err := m.syncSubjectSchema(gctx, s)
+					if err != nil {
+						unlockID()
+						return run.fail(gctx, ss, s, fmt.Errorf("sync subject schema %s version %d: %w", s.Subject, s.Version, err))
+					}
+					// A source ID that maps to two destination IDs is an
+					// inconsistency rather than a rejected subject, so it
+					// aborts the sync.
+					if err := m.checkSchemaIDConflict(s.ID, info); err != nil {
+						unlockID()
+						return fmt.Errorf("sync subject schema %s version %d: %w", s.Subject, s.Version, err)
+					}
+
+					// The schema is registered, so record its ID mapping even if
+					// syncing the compatibility level fails below.
+					m.setSchemaSynced(s, info)
+					unlockID()
+
+					if err := m.syncSubjectCompatibility(gctx, s.Subject); err != nil {
+						return run.failCompat(gctx, ss, s, fmt.Errorf("sync subject compatibility %s: %w", s.Subject, err))
+					}
+
+					m.mu.Lock()
+					m.knownSubjects[schemaSubjectVersionFromSubjectSchema(s)] = struct{}{}
+					m.mu.Unlock()
+
+					run.synced()
+					return nil
+				})
+				if err != nil {
+					// A subject or reference removed from the source during the
+					// sync fails only that root.
+					if run.fail(gctx, ss, ss, fmt.Errorf("sync subject schema %s version %d: %w", ss.Subject, ss.Version, err)) == nil {
+						continue
+					}
+					return err
+				}
+			}
+			return nil
+		})
+	}
+
+	if err := g.Wait(); err != nil {
+		return err
+	}
+	return run.finish(ctx)
+}
+
+// syncRun holds the state of one sync. sync creates one per call, and its
+// workers share it.
+//
+// A subject version that the registry rejects (e.g. an incompatible
+// evolution) is recorded and skipped rather than returned, so that it neither
+// cancels the remaining subjects nor, via the initial sync, fails the output
+// connect. It is retried on the next sync since it is not added to
+// knownSubjects. Any other error, such as an authorization failure or an
+// unreachable registry, is returned and aborts the sync.
+type syncRun struct {
+	m     *schemaRegistryMigrator
+	scope map[string]struct{} // root subjects to sync, nil for all
+	total atomic.Int64        // subject versions synced, for progress logs and partialSyncError
+
+	mu     sync.Mutex
+	failed map[schemaSubjectVersion]error // failed or skipped subject versions; dedups logs, gates referrers
+	minVer map[string]int                 // subject -> lowest failed version; later versions wait for it
+	ids    map[int]struct{}               // source schema IDs that failed or were skipped
+	compat map[string]error               // subjects whose compatibility level failed to sync; dedups logs
+	roots  map[string]struct{}            // roots with a failure; reconciled into m.failedRoots by finish
+
+	// idLocks holds one lock per source schema ID. A worker holds it while it
+	// registers the ID at the destination and records the mapping, see lockID.
+	idLocks map[int]*sync.Mutex
+}
+
+func newSyncRun(m *schemaRegistryMigrator, scope map[string]struct{}) *syncRun {
+	return &syncRun{
+		m:      m,
+		scope:  scope,
+		failed: map[schemaSubjectVersion]error{},
+		minVer: map[string]int{},
+		ids:    map[int]struct{}{},
+		compat: map[string]error{},
+		roots:  map[string]struct{}{},
+
+		idLocks: map[int]*sync.Mutex{},
+	}
+}
+
+// lockID locks the registration of source schema ID id and returns the unlock
+// function.
+//
+// Subjects that share a schema body share one source ID. The Redpanda schema
+// registry looks up the body before it takes its write lock, so two concurrent
+// registrations of a new body under different subjects can each get a new
+// destination ID. The sync would then fail with a schema ID mapping
+// conflict. When one worker at a time registers an ID, the next registration
+// finds the body and gets the same destination ID.
+//
+// TODO(CON-610): this is a workaround for the registry race. Remove it when
+// the fix is released and the migrator no longer supports destinations that
+// run a Redpanda version without the fix.
+func (r *syncRun) lockID(id int) func() {
+	r.mu.Lock()
+	l, exists := r.idLocks[id]
+	if !exists {
+		l = new(sync.Mutex)
+		r.idLocks[id] = l
+	}
+	r.mu.Unlock()
+
+	l.Lock()
+	return l.Unlock
+}
+
+// inScope reports whether the root subject is synced by this run.
+func (r *syncRun) inScope(subject string) bool {
+	if r.scope == nil {
+		return true
+	}
+	_, ok := r.scope[subject]
+	return ok
+}
+
+// record marks s as failed under root, and logs err once per subject version.
+// Records with the schema ID of s are rejected until a sync registers it,
+// unless the ID is already registered.
+func (r *syncRun) record(root, s sr.SubjectSchema, err error) {
+	key := schemaSubjectVersionFromSubjectSchema(s)
+	r.mu.Lock()
+	_, dup := r.failed[key]
+	r.failed[key] = err
+	if v, ok := r.minVer[s.Subject]; s.Version > 0 && (!ok || s.Version < v) {
+		r.minVer[s.Subject] = s.Version
+	}
+	if s.ID != 0 {
+		r.ids[s.ID] = struct{}{}
+	}
+	r.roots[root.Subject] = struct{}{}
+	r.mu.Unlock()
+
+	if s.ID != 0 {
+		r.m.setSchemaFailed(s, err)
+	}
+	if !dup {
+		r.m.log.Errorf("Schema migration: %v", err)
+	}
+}
+
+// fail returns err if the sync must stop: ctx is done, or err is not a
+// subject error. Otherwise it records err under root and returns nil.
+func (r *syncRun) fail(ctx context.Context, root, s sr.SubjectSchema, err error) error {
+	if ctx.Err() != nil {
+		return ctx.Err()
+	}
+	if !isSubjectError(err) {
+		return err
+	}
+	r.record(root, s, err)
+	return nil
+}
+
+// failCompat is fail for a compatibility level that could not be synced after
+// s was registered. Only root is recorded, to be retried: s is registered, so
+// its records translate, and neither its later versions nor its referrers wait
+// for it. s is not added to knownSubjects, so the retry syncs the level again.
+func (r *syncRun) failCompat(ctx context.Context, root, s sr.SubjectSchema, err error) error {
+	if ctx.Err() != nil {
+		return ctx.Err()
+	}
+	if !isSubjectError(err) {
+		return err
+	}
+	r.mu.Lock()
+	_, dup := r.compat[s.Subject]
+	r.compat[s.Subject] = err
+	r.roots[root.Subject] = struct{}{}
+	r.mu.Unlock()
+
+	if !dup {
+		r.m.log.Errorf("Schema migration: %v", err)
+	}
+	return nil
+}
+
+// skip reports whether s must wait for a later sync, and if so records the
+// skip under root.
+//
+// With versions: all, versions are visited in ascending order. Registering a
+// later version after an earlier one failed would shift destination version
+// numbers, so the later versions of a subject wait for the failed version.
+// Earlier versions are not affected, e.g. one referenced by another subject.
+// With versions: latest, destination version numbers do not follow the source
+// anyway, so a failed version, reached through a referrer, does not hold back
+// the latest one.
+//
+// A schema must not be registered without its references, which are visited
+// before it: the destination either rejects it or, if the referenced version
+// exists there as a different schema, binds it to the wrong one.
+func (r *syncRun) skip(root, s sr.SubjectSchema) bool {
+	r.mu.Lock()
+	v, verFailed := r.minVer[s.Subject]
+	var (
+		ref       sr.SchemaReference
+		refFailed bool
+	)
+	for _, rf := range s.References {
+		if _, ok := r.failed[schemaSubjectVersion{Subject: rf.Subject, Version: rf.Version}]; ok {
+			ref, refFailed = rf, true
+			break
+		}
+	}
+	r.mu.Unlock()
+
+	switch {
+	case verFailed && r.m.conf.Versions == VersionsAll && s.Version > v:
+		r.record(root, s, fmt.Errorf("skip subject schema %s version %d: earlier version not synced", s.Subject, s.Version))
+	case refFailed:
+		r.record(root, s, fmt.Errorf("skip subject schema %s version %d: reference %s version %d not synced", s.Subject, s.Version, ref.Subject, ref.Version))
+	default:
+		return false
+	}
+	return true
+}
+
+// synced counts a synced subject version.
+func (r *syncRun) synced() {
+	if n := r.total.Add(1); n%100 == 0 {
+		r.m.log.Infof("Schema migration: synced %d schemas", n)
+	}
+}
+
+// finish reconciles the migrator state with the outcome of the run, and
+// returns a *partialSyncError if any subject version failed.
+//
+// The failed roots in the scope of the run are replaced by those that failed
+// again. Roots outside it, recorded by another sync, are kept.
+//
+// A failed schema that the run did not fail again is pruned once the source no
+// longer has the subject version it failed for, e.g. because the operator
+// deleted it. Otherwise records with its ID would be rejected until restart.
+// While the source still has it, the entry is kept even if no sync visits it
+// any more, since writing its records untranslated could bind them to a
+// different schema at the destination.
+func (r *syncRun) finish(ctx context.Context) error {
+	m := r.m
+
+	m.mu.Lock()
+	if r.scope == nil {
+		m.failedRoots = r.roots
+	} else {
+		if m.failedRoots == nil {
+			m.failedRoots = map[string]struct{}{}
+		}
+		for s := range r.scope {
+			delete(m.failedRoots, s)
+		}
+		maps.Copy(m.failedRoots, r.roots)
+	}
+	stale := map[int]schemaState{}
+	for id, st := range m.schemas {
+		if _, ok := r.ids[id]; st.err != nil && !ok {
+			stale[id] = st
+		}
+	}
+	m.mu.Unlock()
+
+	r.prune(ctx, stale)
+
+	if len(r.failed) > 0 || len(r.compat) > 0 {
+		pErr := &partialSyncError{Synced: int(r.total.Load())}
+		for _, err := range r.failed {
+			pErr.Failed = append(pErr.Failed, err)
+		}
+		for _, err := range r.compat {
+			pErr.Failed = append(pErr.Failed, err)
+		}
+		return pErr
+	}
+	return nil
+}
+
+// prune removes the failed schema entries whose subject version the source no
+// longer has. Syncs are serialized, so no other sync updates the entries
+// concurrently.
+func (r *syncRun) prune(ctx context.Context, stale map[int]schemaState) {
+	m := r.m
+	if m.conf.IncludeDeleted {
+		ctx = sr.WithParams(ctx, sr.ShowDeleted)
+	}
+	for id, st := range stale {
+		_, err := m.src.SchemaByVersion(ctx, st.subject, st.version)
+		var re *sr.ResponseError
+		if !errors.As(err, &re) || re.StatusCode != http.StatusNotFound {
+			continue
+		}
+
+		m.mu.Lock()
+		if cur, ok := m.schemas[id]; ok && cur.err != nil {
+			delete(m.schemas, id)
+		}
+		m.mu.Unlock()
+		m.log.Infof("Schema migration: subject %s version %d no longer at source, records with schema ID %d are no longer rejected",
+			st.subject, st.version, id)
+	}
+}
+
+// partialSyncError is returned by Sync when the sync ran to completion but
+// some subject versions could not be synced. Each failure is logged as it
+// happens. Any other error returned by Sync means the sync itself could not
+// run, e.g. a misconfigured or unreachable registry.
+type partialSyncError struct {
+	Synced int
+	Failed []error
+}
+
+func (e *partialSyncError) Error() string {
+	return fmt.Sprintf("%d schemas synced, %d failed", e.Synced, len(e.Failed))
+}
+
+// fixedIDError reports that, with translate_ids disabled, a schema cannot be
+// registered at the destination under its source ID. Records carrying that ID
+// are copied unchanged and would resolve at the destination to a different
+// schema, or to none, so this fails the sync rather than a single subject.
+type fixedIDError struct {
+	err error
+}
+
+func (e *fixedIDError) Error() string { return e.err.Error() }
+
+func (e *fixedIDError) Unwrap() error { return e.err }
+
+// isSubjectError reports whether err is a schema registry rejection of a single
+// subject or version, as opposed to a failure of the registry as a whole.
+func isSubjectError(err error) bool {
+	if _, ok := errors.AsType[*fixedIDError](err); ok {
+		return false
+	}
+	var re *sr.ResponseError
+	if !errors.As(err, &re) {
+		return false
+	}
+	switch re.StatusCode {
+	case http.StatusNotFound, http.StatusConflict, http.StatusUnprocessableEntity:
+		return true
+	default:
+		return false
+	}
+}
+
+func (m *schemaRegistryMigrator) checkSchemaIDConflict(srcID int, dstInfo schemaInfo) error {
+	m.mu.RLock()
+	cur, ok := m.schemas[srcID]
+	m.mu.RUnlock()
+
+	if ok && cur.err == nil && cur.info.ID != dstInfo.ID {
+		return fmt.Errorf("schema ID mapping conflict: source ID %d maps to both destination IDs %d and %d",
+			srcID, cur.info.ID, dstInfo.ID)
+	}
+
+	return nil
+}
+
+func (m *schemaRegistryMigrator) enabled() bool {
+	return m.conf.Enabled && (m.src != nil || m.dst != nil)
+}
+
+func (m *schemaRegistryMigrator) validateSchemaRegistries(ctx context.Context) error {
+	if m.src == nil {
+		return errors.New("source schema registry client not configured")
+	}
+	if m.dst == nil {
+		return errors.New("destination schema registry client not configured")
+	}
+	if m.srcURL == m.dstURL {
+		return fmt.Errorf("source and destination schema registry URLs must be different: %s", m.srcURL)
+	}
+	mode, err := srGlobalMode(ctx, m.dst)
+	if err != nil {
+		return err
+	}
+	m.log.Debugf("Schema migration: destination schema registry mode=%s", mode)
+	if mode != sr.ModeReadWrite && mode != sr.ModeImport {
+		return fmt.Errorf("schema registry instance mode must be READWRITE or IMPORT, got %q", mode)
+	}
+
+	return nil
+}
+
+func (m *schemaRegistryMigrator) resolveSubject(subject string, version int) (string, error) {
+	if m.conf.NameResolver == nil {
+		return subject, nil
+	}
+
+	msg := service.NewMessage(nil)
+	msg.MetaSetMut("schema_registry_subject", subject)
+	msg.MetaSetMut("schema_registry_version", strconv.Itoa(version))
+
+	dstSubject, err := m.conf.NameResolver.TryString(msg)
+	if err != nil {
+		return "", fmt.Errorf("resolve destination subject: %s", err)
+	}
+	if dstSubject == "" {
+		return "", errors.New("resolved empty destination subject")
+	}
+	return dstSubject, nil
+}
+
+func (m *schemaRegistryMigrator) syncSubjectSchema(ctx context.Context, ss sr.SubjectSchema) (schemaInfo, error) {
+	dstSubject, err := m.resolveSubject(ss.Subject, ss.Version)
+	if err != nil {
+		return schemaInfo{}, err
+	}
+	if dstSubject != ss.Subject {
+		m.log.Debugf("Schema migration: resolved subject=%s version=%d => subject=%s",
+			ss.Subject, ss.Version, dstSubject)
+	}
+
+	if m.conf.Normalize {
+		ctx = sr.WithParams(ctx, sr.Normalize)
+	}
+
+	sch := ss.Schema // shallow copy
+	// In serverless, the schema registry does not store schema metadata
+	if m.conf.Serverless {
+		sch.SchemaMetadata = nil
+		sch.SchemaRuleSet = nil
+	}
+
+	var info schemaInfo
+	t0 := time.Now()
+	if m.conf.TranslateIDs {
+		// Register with a registry-assigned ID. If the schema is already
+		// registered (and identical), this returns the existing ID without
+		// creating a new version.
+		//
+		// RegisterSchema is used instead of CreateSchema because CreateSchema
+		// additionally resolves the returned ID via SchemaUsagesByID, which
+		// fetches every subject-version sharing that ID using one unbounded
+		// goroutine per usage. Identical schema bodies deduplicate to a single
+		// ID, so syncing N such subjects costs O(N^2) destination requests,
+		// none of them bounded by MaxParallelHTTPRequests.
+		const autoAssign = -1
+		id, err := m.dst.RegisterSchema(ctx, dstSubject, sch, autoAssign, autoAssign)
+		if err != nil {
+			m.metrics.IncSchemaCreateErrors()
+			return schemaInfo{}, fmt.Errorf("create schema: %w", err)
+		}
+
+		// The destination version is left unset: the registration response
+		// carries only the ID, which is also the only field of schemaInfo
+		// with a functional consumer.
+		info = schemaInfo{Subject: dstSubject, ID: id}
+		m.log.Infof("Schema migration: schema created with translated id: subject=%s version=%d id=%d => subject=%s id=%d",
+			ss.Subject, ss.Version, ss.ID, info.Subject, info.ID)
+	} else {
+		// RegisterSchema instead of CreateSchemaWithIDAndVersion for the same
+		// reason as above: the latter resolves the registered ID through the
+		// unbounded SchemaUsagesByID fan-out, and the ID and version are
+		// already known here.
+		id, err := m.dst.RegisterSchema(ctx, dstSubject, sch, ss.ID, ss.Version)
+		if err != nil {
+			const conflictPattern = `Schema already registered with id \d+ instead of input id \d+`
+			if ok, _ := regexp.MatchString(conflictPattern, err.Error()); ok {
+				return schemaInfo{}, &fixedIDError{fmt.Errorf("create schema: %w - try enabling translate-ids", err)}
+			}
+
+			// This is a workaround for Allow POSTing the same schemas with
+			// a fixed ID multiple times [1]. We manually check if the schema
+			// already exists and if it is identical to the one we're trying to
+			// create.
+			//
+			// [1] https://github.com/redpanda-data/redpanda/issues/26331
+			s, lookupErr := m.dst.SchemaByID(sr.WithParams(ctx, sr.ShowDeleted), ss.ID)
+			if lookupErr == nil && !schemaEquals(s, sch) {
+				m.metrics.IncSchemaCreateErrors()
+				return schemaInfo{}, &fixedIDError{fmt.Errorf("create schema: %w - destination holds a different schema with id %d, try enabling translate-ids", err, ss.ID)}
+			}
+			if lookupErr != nil {
+				m.metrics.IncSchemaCreateErrors()
+				return schemaInfo{}, fmt.Errorf("create schema: %w", err)
+			}
+
+			// If the schema already exists (and is identical), use the source
+			// schema ID and version...
+			m.log.Warnf("Schema migration: schema subject=%s version=%d id=%d could not be created (server error: %s) - using existing schema with the same ID, if this is not the desired behavior, try enabling translate-ids",
+				ss.Subject, ss.Version, ss.ID, err.Error())
+
+			id = ss.ID
+		}
+
+		info = schemaInfo{Subject: dstSubject, Version: ss.Version, ID: id}
+		m.log.Infof("Schema migration: schema created with fixed id: subject=%s version=%d id=%d",
+			info.Subject, info.Version, info.ID)
+	}
+	m.metrics.ObserveSchemaCreateLatency(time.Since(t0))
+	m.metrics.IncSchemasCreated()
+
+	return info, nil
+}
+
+func schemaEquals(a, b sr.Schema) bool {
+	if a.Schema != b.Schema {
+		if a.Type != b.Type {
+			return false
+		}
+		if !schemaStringEquals(a.Schema, b.Schema, a.Type) {
+			return false
+		}
+	}
+
+	return cmp.Equal(a, b, cmpopts.IgnoreFields(sr.Schema{}, "Schema"))
+}
+
+// schemaStringEquals compares two schema strings for equality, ignoring
+// newlines and leading/trailing spaces in the schemas.
+//
+// For JSON and Avro schemas, the function parses the schemas as JSON and
+// compares the resulting maps. For Protobuf schemas, the function removes
+// newlines and leading/trailing spaces from the schemas and compares the
+// resulting strings.
+func schemaStringEquals(a, b string, st sr.SchemaType) bool {
+	switch st {
+	case sr.TypeAvro, sr.TypeJSON:
+		// Parse the schemas as JSON
+		var as, bs map[string]any
+		if err := json.Unmarshal([]byte(a), &as); err != nil {
+			return false
+		}
+		if err := json.Unmarshal([]byte(b), &bs); err != nil {
+			return false
+		}
+		if !cmp.Equal(as, bs) {
+			return false
+		}
+	case sr.TypeProtobuf:
+		// Remove newlines and leading/trailing spaces from the schemas
+		as := strings.TrimSpace(strings.ReplaceAll(a, "\n", ""))
+		bs := strings.TrimSpace(strings.ReplaceAll(b, "\n", ""))
+		if as != bs {
+			return false
+		}
+	default:
+		return false
+	}
+
+	return true
+}
+
+func (m *schemaRegistryMigrator) syncSubjectCompatibility(ctx context.Context, subject string) error {
+	var cl sr.CompatibilityLevel
+	res := m.src.Compatibility(ctx, subject)
+	if res[0].Err == nil && res[0].Level != 0 {
+		cl = res[0].Level
+	}
+	if cl == 0 {
+		m.log.Debugf("Schema migration: no explicit compatibility level to apply for subject=%s", subject)
+		return nil
+	}
+
+	dstSubject, err := m.resolveSubject(subject, 0)
+	if err != nil {
+		return err
+	}
+
+	t0 := time.Now()
+	set := m.dst.SetCompatibility(ctx, sr.SetCompatibility{Level: cl}, dstSubject)
+	if set[0].Err != nil {
+		m.metrics.IncCompatUpdateErrors()
+		return fmt.Errorf("set destination subject compatibility for %q: %w", dstSubject, set[0].Err)
+	}
+	m.metrics.ObserveCompatUpdateLatency(time.Since(t0))
+	m.metrics.IncCompatUpdates()
+
+	m.log.Infof("Schema migration: set compatibility level=%s subject=%s", cl, dstSubject)
+
+	return nil
+}
+
+var (
+	noMode  sr.Mode = -1
+	errMode sr.Mode = -2 // sentinel: setSubjectMode failed, do not retry or restore
+)
+
+func srGlobalMode(ctx context.Context, client *sr.Client) (sr.Mode, error) {
+	res := client.Mode(ctx)
+	if res[0].Err != nil {
+		return noMode, fmt.Errorf("fetch schema registry mode: %w", res[0].Err)
+	}
+	return res[0].Mode, nil
+}
+
+// importModeManager manages per-subject IMPORT mode transitions for serverless
+// schema registries. It sets each destination subject to IMPORT mode at most
+// once (before the first version is written) and restores the original mode
+// when Close is called (after all sync work completes).
+//
+// All mode restoration happens in Close rather than eagerly after individual
+// versions because concurrent DFS walkers may independently discover the same
+// dependency subject, making eager per-version restoration unsafe.
+//
+// When the destination global mode is already IMPORT, or when the migrator is
+// not in serverless mode, all operations are no-ops.
+type importModeManager struct {
+	*schemaRegistryMigrator
+	active bool
+
+	mu         sync.RWMutex
+	prevMode   map[string]sr.Mode // destination subject -> previous mode (or noMode if not set)
+	callbackMu sync.Mutex         // serializes TestingOnSetSubjectMode calls from concurrent goroutines
+}
+
+func (m *schemaRegistryMigrator) newImportModeManager(ctx context.Context) (*importModeManager, error) {
+	c := &importModeManager{schemaRegistryMigrator: m}
+	if !m.conf.Serverless {
+		return c, nil
+	}
+
+	mode, err := srGlobalMode(ctx, m.dst)
+	if err != nil {
+		return nil, err
+	}
+	if mode == sr.ModeImport {
+		return c, nil
+	}
+
+	c.active = true
+	c.prevMode = make(map[string]sr.Mode)
+
+	return c, nil
+}
+
+// TrySetImportMode sets the subject to IMPORT mode if not already done.
+// No-op when inactive or when the destination subject was already switched.
+// All switched subjects are restored when Close is called.
+func (c *importModeManager) TrySetImportMode(ctx context.Context, src sr.SubjectSchema) error {
+	if !c.active {
+		return nil
+	}
+
+	dstSubject, err := c.resolveSubject(src.Subject, src.Version)
+	if err != nil {
+		return err
+	}
+
+	// Fast path: destination subject already tracked.
+	c.mu.RLock()
+	_, ok := c.prevMode[dstSubject]
+	c.mu.RUnlock()
+	if ok {
+		return nil
+	}
+
+	// Slow path: hold exclusive lock across the entire check-fetch-set
+	// sequence to prevent concurrent goroutines from racing on the same
+	// subject and clobbering the original mode.
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	if _, ok := c.prevMode[dstSubject]; ok {
+		return nil
+	}
+
+	mode, err := srSubjectMode(ctx, c.dst, dstSubject)
+	if err != nil {
+		if strings.Contains(err.Error(), "does not have subject-level mode configured") {
+			mode = noMode
+		} else {
+			return err
+		}
+	} else if mode == sr.ModeImport {
+		c.prevMode[dstSubject] = mode
+		return nil
+	}
+
+	c.log.Infof("Schema migration: setting subject=%s mode to %s for migration", dstSubject, sr.ModeImport)
+	if err := c.setSubjectMode(ctx, dstSubject, sr.ModeImport); err != nil {
+		c.log.Warnf("Schema migration: failed to set subject=%s mode to IMPORT: %v", dstSubject, err)
+		c.prevMode[dstSubject] = errMode
+		return nil
+	}
+
+	c.prevMode[dstSubject] = mode
+
+	return nil
+}
+
+// Close restores all subjects that were switched to IMPORT mode.
+// Restorations run in parallel (bounded by MaxParallelHTTPRequests)
+// with up to 3 attempts for transient failures.
+func (c *importModeManager) Close() {
+	if !c.active {
+		return
+	}
+
+	const maxAttempts = 3
+	for attempt := range maxAttempts {
+		c.mu.RLock()
+		if len(c.prevMode) == 0 {
+			c.mu.RUnlock()
+			return
+		}
+		subjects := make([]string, 0, len(c.prevMode))
+		for s := range c.prevMode {
+			subjects = append(subjects, s)
+		}
+		c.mu.RUnlock()
+
+		g, _ := errgroup.WithContext(context.Background())
+		g.SetLimit(c.conf.MaxParallelHTTPRequests)
+		for _, dstSubject := range subjects {
+			g.Go(func() error {
+				if err := c.restore(dstSubject); err != nil {
+					c.log.Warnf("Schema migration: %v (attempt %d/%d)", err, attempt+1, maxAttempts)
+				}
+				return nil
+			})
+		}
+		_ = g.Wait() // errors are logged individually; partial failures do not abort the batch
+	}
+
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	if len(c.prevMode) > 0 {
+		remaining := make([]string, 0, len(c.prevMode))
+		for s := range c.prevMode {
+			remaining = append(remaining, s)
+		}
+		c.log.Errorf("Schema migration: failed to restore mode after %d attempts, giving up subjects=%v", maxAttempts, remaining)
+	}
+}
+
+// restore restores the original mode for a single destination subject. Thread-safe.
+func (c *importModeManager) restore(dstSubject string) error {
+	c.mu.RLock()
+	prevMode, ok := c.prevMode[dstSubject]
+	c.mu.RUnlock()
+	if !ok {
+		return nil
+	}
+
+	if prevMode == sr.ModeImport || prevMode == errMode {
+		c.mu.Lock()
+		delete(c.prevMode, dstSubject)
+		c.mu.Unlock()
+		return nil
+	}
+
+	if prevMode == noMode {
+		c.log.Infof("Schema migration: resetting subject=%s mode", dstSubject)
+	} else {
+		c.log.Infof("Schema migration: restoring subject=%s mode to %s", dstSubject, prevMode)
+	}
+
+	if err := c.setSubjectMode(context.Background(), dstSubject, prevMode); err != nil {
+		return fmt.Errorf("restore subject=%s mode to %s: %w", dstSubject, prevMode, err)
+	}
+
+	c.mu.Lock()
+	delete(c.prevMode, dstSubject)
+	c.mu.Unlock()
+	return nil
+}
+
+func srSubjectMode(ctx context.Context, client *sr.Client, subject string) (sr.Mode, error) {
+	res := client.Mode(ctx, subject)
+	if res[0].Err != nil {
+		return 0, fmt.Errorf("fetch subject mode: %w", res[0].Err)
+	}
+	return res[0].Mode, nil
+}
+
+func (c *importModeManager) setSubjectMode(ctx context.Context, subject string, mode sr.Mode) error {
+	if mode == noMode {
+		res := c.dst.ResetMode(ctx, subject)
+		if res[0].Err != nil {
+			return fmt.Errorf("reset subject mode: %w", res[0].Err)
+		}
+	} else {
+		res := c.dst.SetMode(ctx, mode, subject)
+		if res[0].Err != nil {
+			return fmt.Errorf("set subject mode to %s: %w", mode, res[0].Err)
+		}
+	}
+
+	if c.conf.TestingOnSetSubjectMode != nil {
+		c.callbackMu.Lock()
+		c.conf.TestingOnSetSubjectMode(subject, mode)
+		c.callbackMu.Unlock()
+	}
+
+	return nil
+}
+
+// DestinationSchemaID attempts to fetch the destination schema ID for the
+// provided source schema ID.
+func (m *schemaRegistryMigrator) DestinationSchemaID(schemaID int) (int, error) {
+	if !m.enabled() {
+		return schemaID, nil
+	}
+
+	m.mu.RLock()
+	st, ok := m.schemas[schemaID]
+	m.mu.RUnlock()
+	if ok {
+		// A record encoded with a schema that failed to sync must not be
+		// written with the source ID, which at the destination may identify a
+		// different schema. The write is retried until a later sync registers
+		// the schema.
+		if st.err != nil {
+			return 0, fmt.Errorf("schema ID %d not synced to destination schema registry: %w", schemaID, st.err)
+		}
+		return st.info.ID, nil
+	}
+
+	// Schema not found in cache
+	if m.conf.Strict {
+		return 0, fmt.Errorf("schema ID %d not found in registry", schemaID)
+	}
+
+	return schemaID, nil
+}
+
+type schemaRegistryMetrics struct {
+	schemasCreated      *service.MetricCounter
+	schemaCreateErrors  *service.MetricCounter
+	schemaCreateLatency *service.MetricTimer
+	compatUpdates       *service.MetricCounter
+	compatUpdateErrors  *service.MetricCounter
+	compatUpdateLatency *service.MetricTimer
+}
+
+func newSchemaRegistryMetrics(m *service.Metrics) *schemaRegistryMetrics {
+	return &schemaRegistryMetrics{
+		schemasCreated:      m.NewCounter("redpanda_migrator_sr_schemas_created_total"),
+		schemaCreateErrors:  m.NewCounter("redpanda_migrator_sr_schema_create_errors_total"),
+		schemaCreateLatency: m.NewTimer("redpanda_migrator_sr_schema_create_latency_ns"),
+		compatUpdates:       m.NewCounter("redpanda_migrator_sr_compatibility_updates_total"),
+		compatUpdateErrors:  m.NewCounter("redpanda_migrator_sr_compatibility_update_errors_total"),
+		compatUpdateLatency: m.NewTimer("redpanda_migrator_sr_compatibility_update_latency_ns"),
+	}
+}
+
+func (sm *schemaRegistryMetrics) IncSchemasCreated() {
+	if sm == nil {
+		return
+	}
+	sm.schemasCreated.Incr(1)
+}
+
+func (sm *schemaRegistryMetrics) IncSchemaCreateErrors() {
+	if sm == nil {
+		return
+	}
+	sm.schemaCreateErrors.Incr(1)
+}
+
+func (sm *schemaRegistryMetrics) ObserveSchemaCreateLatency(d time.Duration) {
+	if sm == nil {
+		return
+	}
+	sm.schemaCreateLatency.Timing(d.Nanoseconds())
+}
+
+func (sm *schemaRegistryMetrics) IncCompatUpdates() {
+	if sm == nil {
+		return
+	}
+	sm.compatUpdates.Incr(1)
+}
+
+func (sm *schemaRegistryMetrics) IncCompatUpdateErrors() {
+	if sm == nil {
+		return
+	}
+	sm.compatUpdateErrors.Incr(1)
+}
+
+func (sm *schemaRegistryMetrics) ObserveCompatUpdateLatency(d time.Duration) {
+	if sm == nil {
+		return
+	}
+	sm.compatUpdateLatency.Timing(d.Nanoseconds())
+}

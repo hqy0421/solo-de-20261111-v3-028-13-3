@@ -1,0 +1,82 @@
+// Copyright 2025 Redpanda Data, Inc.
+//
+// Licensed as a Redpanda Enterprise file under the Redpanda Community
+// License (the "License"); you may not use this file except in compliance with
+// the License. You may obtain a copy of the License at
+//
+// https://github.com/redpanda-data/connect/v4/blob/main/licenses/rcl.md
+
+package pglogicalstream
+
+import (
+	"context"
+	"database/sql"
+	"time"
+
+	incsnapshot "github.com/redpanda-data/connect/v4/internal/impl/postgresql/incrementalsnapshot"
+
+	"github.com/redpanda-data/benthos/v4/public/service"
+
+	"github.com/redpanda-data/connect/v4/internal/asyncroutine"
+)
+
+type heartbeat struct {
+	db            *sql.DB
+	task          *asyncroutine.Periodic
+	logger        *service.Logger
+	prefix, value string
+	// transactional determines whether the next tick emits a transactional or
+	// non-transactional message via pg_logical_emit_message:
+	//
+	// - Non-transactional (false): Emits directly into WAL without allocating an
+	//   XID or generating a COMMIT record. Conserves finite 32-bit transaction IDs
+	//   and advances confirmed_flush_lsn during idle streaming.
+	// - Transactional (true): Allocates a 32-bit XID and emits BEGIN/COMMIT frames.
+	//   Required during incremental snapshotting because the DBLog watermark
+	//   algorithm closes chunk windows only upon observing a commit where
+	//   xid >= high.Xmax. On quiet tables without write traffic, synthetic commits
+	//   from this message serve as the clock ticks that advance the snapshot.
+	//
+	// Because continuously burning XIDs risks transaction ID exhaustion and
+	// aggressive autovacuum freezes, this predicate returns true only while
+	// snapshot backfills are actively queued.
+	transactional func() bool
+}
+
+func newHeartbeat(config *Config, interval time.Duration, prefix, value string, transactional func() bool) (*heartbeat, error) {
+	dbConn, err := openPgConnectionFromConfig(config)
+	if err != nil {
+		return nil, err
+	}
+	h := &heartbeat{db: dbConn, task: nil, logger: config.Logger, prefix: prefix, value: value, transactional: transactional}
+	h.task = asyncroutine.NewPeriodicWithContext(interval, h.run)
+	return h, nil
+}
+
+func (h *heartbeat) Start() {
+	h.task.Start()
+}
+
+func (h *heartbeat) run(ctx context.Context) {
+	var err error
+	if h.transactional != nil && h.transactional() {
+		_, err = h.db.ExecContext(ctx, "SELECT pg_logical_emit_message(true, $1, $2)", h.prefix, h.value)
+	} else {
+		_, err = h.db.ExecContext(ctx, "SELECT pg_logical_emit_message(false, $1, $2)", h.prefix, h.value)
+	}
+	if err != nil {
+		h.logger.Warnf("unable to write heartbeat message: %v", err)
+	}
+}
+
+func (h *heartbeat) Stop() error {
+	h.task.Stop()
+	return h.db.Close()
+}
+
+func effectiveHeartbeatInterval(configured time.Duration, incSnapshot incsnapshot.Cfg) time.Duration {
+	if !incSnapshot.Enabled || incSnapshot.HeartbeatInterval <= 0 {
+		return configured
+	}
+	return min(configured, incSnapshot.HeartbeatInterval)
+}

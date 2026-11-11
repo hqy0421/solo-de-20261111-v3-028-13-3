@@ -1,0 +1,860 @@
+// Copyright 2024 Redpanda Data, Inc.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//    http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package sftp
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"net"
+	"net/http"
+	"strings"
+	"sync"
+	"testing"
+	"time"
+
+	"github.com/pkg/sftp"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+	"github.com/testcontainers/testcontainers-go"
+	"github.com/testcontainers/testcontainers-go/wait"
+	"golang.org/x/crypto/ssh"
+
+	"github.com/redpanda-data/benthos/v4/public/service"
+	"github.com/redpanda-data/benthos/v4/public/service/integration"
+
+	// Bring in memory cache.
+	_ "github.com/redpanda-data/benthos/v4/public/components/pure"
+)
+
+var (
+	sftpUsername = "admin"
+	sftpPassword = "password"
+)
+
+func TestIntegrationSFTP(t *testing.T) {
+	integration.CheckSkip(t)
+
+	emulator := runEmulator(t)
+
+	t.Run("sftp", func(t *testing.T) {
+		template := `
+output:
+  sftp:
+    address: $VAR1
+    path: /upload/test-$ID/${!uuid_v4()}.txt
+    credentials:
+      username: $VAR2
+      password: $VAR3
+      host_public_key: $VAR4
+    codec: all-bytes
+    max_in_flight: 1
+
+input:
+  sftp:
+    address: $VAR1
+    paths:
+      - /upload/test-$ID/*.txt
+    credentials:
+      username: $VAR2
+      password: $VAR3
+      host_public_key: $VAR4
+    scanner:
+      to_the_end: {}
+    delete_on_finish: false
+    watcher:
+      enabled: $VAR5
+      minimum_age: 100ms
+      poll_interval: 100ms
+      cache: files_memory
+
+cache_resources:
+  - label: files_memory
+    memory:
+      default_ttl: 900s
+`
+		suite := integration.StreamTests(
+			integration.StreamTestOpenCloseIsolated(),
+			integration.StreamTestStreamIsolated(100),
+		)
+		suite.Run(
+			t, template,
+			integration.StreamTestOptPort(emulator.address),
+			integration.StreamTestOptVarSet("VAR1", emulator.address),
+			integration.StreamTestOptVarSet("VAR2", sftpUsername),
+			integration.StreamTestOptVarSet("VAR3", sftpPassword),
+			integration.StreamTestOptVarSet("VAR4", emulator.hostKey),
+			integration.StreamTestOptVarSet("VAR5", "false"),
+		)
+
+		t.Run("watcher", func(t *testing.T) {
+			watcherSuite := integration.StreamTests(
+				integration.StreamTestOpenClose(),
+				integration.StreamTestStreamParallel(50),
+				integration.StreamTestStreamSequential(20),
+				integration.StreamTestStreamParallelLossyThroughReconnect(20),
+			)
+			watcherSuite.Run(
+				t, template,
+				integration.StreamTestOptPort(emulator.address),
+				integration.StreamTestOptVarSet("VAR1", emulator.address),
+				integration.StreamTestOptVarSet("VAR2", sftpUsername),
+				integration.StreamTestOptVarSet("VAR3", sftpPassword),
+				integration.StreamTestOptVarSet("VAR4", emulator.hostKey),
+				integration.StreamTestOptVarSet("VAR5", "true"),
+			)
+		})
+	})
+}
+
+func TestIntegrationSFTPDeleteOnFinish(t *testing.T) {
+	integration.CheckSkip(t)
+
+	emulator := runEmulator(t)
+
+	err := emulator.client.MkdirAll("/upload")
+	require.NoError(t, err)
+
+	writeSFTPFile(t, emulator.client, "/upload/1.txt", "data-1")
+	writeSFTPFile(t, emulator.client, "/upload/2.txt", "data-2")
+	writeSFTPFile(t, emulator.client, "/upload/3.txt", "data-3")
+
+	config := `
+output:
+  drop: {}
+
+input:
+  sftp:
+    address: $VAR1
+    paths:
+      - /upload/*.txt
+    credentials:
+      username: $VAR2
+      password: $VAR3
+      host_public_key: $VAR4
+    scanner:
+      to_the_end: {}
+    delete_on_finish: true
+    watcher:
+      enabled: true
+      poll_interval: 100ms
+      cache: files_memory
+
+cache_resources:
+  - label: files_memory
+    memory:
+      default_ttl: 900s
+`
+	config = strings.NewReplacer(
+		"$VAR1", emulator.address,
+		"$VAR2", sftpUsername,
+		"$VAR3", sftpPassword,
+		"$VAR4", emulator.hostKey,
+	).Replace(config)
+
+	var receivedPathsMut sync.Mutex
+	var receivedPaths []string
+
+	builder := service.NewStreamBuilder()
+	require.NoError(t, builder.SetYAML(config))
+	require.NoError(t, builder.AddConsumerFunc(func(_ context.Context, msg *service.Message) error {
+		receivedPathsMut.Lock()
+		defer receivedPathsMut.Unlock()
+		path, ok := msg.MetaGet("sftp_path")
+		if !ok {
+			return errors.New("sftp_path metadata not found")
+		}
+		receivedPaths = append(receivedPaths, path)
+		return nil
+	}))
+	stream, err := builder.Build()
+	require.NoError(t, err)
+
+	ctx, cancel := context.WithCancel(t.Context())
+	runErr := make(chan error)
+	go func() { runErr <- stream.Run(ctx) }()
+	defer func() {
+		cancel()
+		err := <-runErr
+		if err != context.Canceled {
+			require.NoError(t, err, "stream.Run() failed")
+		}
+	}()
+
+	require.EventuallyWithT(t, func(c *assert.CollectT) {
+		receivedPathsMut.Lock()
+		defer receivedPathsMut.Unlock()
+		assert.Len(c, receivedPaths, 3)
+
+		files, err := emulator.client.Glob("/upload/*.txt")
+		assert.NoError(c, err)
+		assert.Empty(c, files)
+	}, time.Second*10, time.Millisecond*100)
+}
+
+// TestIntegrationSFTPOutputRecoversFromRepeatedWriteFailures reproduces
+// https://github.com/redpanda-data/connect/issues/3584: an SFTP output that
+// fails to open a remote file (e.g. a permissions error) used to leave a
+// stale SFTP client, and its underlying SSH channel, attached to the writer.
+// Every retry then leaked another channel until the server's per-connection
+// channel limit was exhausted, at which point the output could never
+// reconnect and required a restart. Writes must fail cleanly instead, and
+// the connection must remain usable afterwards.
+func TestIntegrationSFTPOutputRecoversFromRepeatedWriteFailures(t *testing.T) {
+	integration.CheckSkip(t)
+
+	emu := runEmulator(t)
+	require.NoError(t, emu.client.MkdirAll("/upload"))
+
+	// A regular file where the writer will try to create a directory, so
+	// every write below it fails deterministically without relying on
+	// permission configuration.
+	writeSFTPFile(t, emu.client, "/upload/blocked", "not-a-directory")
+
+	conf := fmt.Sprintf(`
+address: %s
+path: /upload/blocked/file.txt
+credentials:
+  username: %s
+  password: %s
+  host_public_key: %s
+codec: all-bytes
+`, emu.address, sftpUsername, sftpPassword, emu.hostKey)
+
+	parsed, err := sftpOutputSpec().ParseYAML(conf, nil)
+	require.NoError(t, err)
+
+	writer, err := newWriterFromParsed(parsed, service.MockResources())
+	require.NoError(t, err)
+	require.NoError(t, writer.Connect(t.Context()))
+	t.Cleanup(func() { require.NoError(t, writer.Close(context.Background())) })
+
+	// Sessions the server already has open, including the emulator's own
+	// client. sftpgo has no per-connection channel cap, so the leak shows up
+	// as a growing session count rather than as a failure to connect.
+	baseline, err := emu.openConnections()
+	require.NoError(t, err)
+
+	// More attempts than a typical SSH server's default per-connection
+	// channel limit (OpenSSH defaults to 10), so a channel leak on failure
+	// would eventually surface as a connection-level error on such a server.
+	for range 20 {
+		err := writer.Write(t.Context(), service.NewMessage([]byte("payload")))
+		require.Error(t, err)
+		require.NotErrorIs(t, err, service.ErrNotConnected)
+		assert.Nil(t, writer.sftpClient, "a failed write must not leave a stale SFTP client behind")
+		assert.Nil(t, writer.handle, "a failed write must not leave a stale file handle behind")
+	}
+
+	// The server must agree that nothing was left behind. sftpgo drops a
+	// session as soon as its channel closes, but don't rely on that being
+	// synchronous with the client-side Close.
+	require.EventuallyWithT(t, func(c *assert.CollectT) {
+		open, err := emu.openConnections()
+		assert.NoError(c, err)
+		assert.LessOrEqual(c, open, baseline, "failed writes must not leave SFTP channels open on the server")
+	}, time.Second*10, time.Millisecond*100)
+
+	// The underlying SSH connection must still be healthy.
+	writer.path, err = service.NewInterpolatedString("/upload/ok.txt")
+	require.NoError(t, err)
+	require.NoError(t, writer.Write(t.Context(), service.NewMessage([]byte("payload"))))
+}
+
+func TestIntegrationSFTPLegacySSHAlgorithms(t *testing.T) {
+	integration.CheckSkip(t)
+
+	emu := runEmulator(t, withLegacyAlgorithmsOnly(ssh.InsecureKeyExchangeDHGEXSHA1, ssh.InsecureCipherAES128CBC))
+	require.NoError(t, emu.client.MkdirAll("/upload"))
+
+	connection := func(algorithms string) string {
+		return fmt.Sprintf(`
+address: %s
+credentials:
+  username: %s
+  password: %s
+  host_public_key: %s
+`, emu.address, sftpUsername, sftpPassword, emu.hostKey) + algorithms
+	}
+
+	newWriter := func(t *testing.T, algorithms string) *sftpWriter {
+		t.Helper()
+		parsed, err := sftpOutputSpec().ParseYAML(connection(algorithms)+`
+path: /upload/legacy.txt
+codec: all-bytes
+`, nil)
+		require.NoError(t, err)
+		writer, err := newWriterFromParsed(parsed, service.MockResources())
+		require.NoError(t, err)
+		t.Cleanup(func() { require.NoError(t, writer.Close(context.Background())) })
+		return writer
+	}
+
+	t.Run("defaults fail to negotiate", func(t *testing.T) {
+		err := newWriter(t, "").Connect(t.Context())
+		require.ErrorContains(t, err, "no common algorithm for key exchange")
+	})
+
+	t.Run("key exchange alone is not enough", func(t *testing.T) {
+		err := newWriter(t, fmt.Sprintf(`
+  ssh_algorithms:
+    additional_key_exchanges: [ %s ]
+`, ssh.InsecureKeyExchangeDHGEXSHA1)).Connect(t.Context())
+		require.ErrorContains(t, err, "no common algorithm for client to server cipher")
+	})
+
+	t.Run("opted in algorithms round trip", func(t *testing.T) {
+		algorithms := fmt.Sprintf(`
+  ssh_algorithms:
+    additional_key_exchanges: [ %s ]
+    additional_ciphers: [ %s ]
+`, ssh.InsecureKeyExchangeDHGEXSHA1, ssh.InsecureCipherAES128CBC)
+
+		writer := newWriter(t, algorithms)
+		require.NoError(t, writer.Connect(t.Context()))
+		require.NoError(t, writer.Write(t.Context(), service.NewMessage([]byte("legacy-data"))))
+
+		parsed, err := sftpInputSpec().ParseYAML(connection(algorithms)+`
+paths:
+  - /upload/legacy.txt
+scanner:
+  to_the_end: {}
+`, nil)
+		require.NoError(t, err)
+		reader, err := newSFTPReaderFromParsed(parsed, service.MockResources())
+		require.NoError(t, err)
+		require.NoError(t, reader.Connect(t.Context()))
+		t.Cleanup(func() { require.NoError(t, reader.Close(context.Background())) })
+
+		assert.Equal(t, "legacy-data", mustReadOneFile(t, t.Context(), reader))
+	})
+}
+
+type emulator struct {
+	client  *sftp.Client
+	address string
+	hostKey string
+
+	// httpAddr and adminToken address the sftpgo admin REST API, which
+	// reports the sessions the server currently has open.
+	httpAddr   string
+	adminToken string
+}
+
+// openConnections returns the number of sessions sftpgo currently has open.
+// The server tracks each SFTP channel as its own connection, so this counts
+// live sftp.Client instances rather than SSH connections.
+func (e emulator) openConnections() (int, error) {
+	req, err := http.NewRequest(http.MethodGet, "http://"+e.httpAddr+"/api/v2/connections", nil)
+	if err != nil {
+		return 0, err
+	}
+	req.Header.Set("Authorization", "Bearer "+e.adminToken)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return 0, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return 0, fmt.Errorf("listing connections: unexpected status %d", resp.StatusCode)
+	}
+	var conns []struct{}
+	if err := json.NewDecoder(resp.Body).Decode(&conns); err != nil {
+		return 0, err
+	}
+	return len(conns), nil
+}
+
+// emulatorOptions customises the sftpgo server started by runEmulator.
+type emulatorOptions struct {
+	// env holds additional sftpgo environment configuration.
+	env map[string]string
+	// sshConfig holds the transport algorithms the emulator's own client
+	// uses, which must overlap with any algorithms restricted through env.
+	sshConfig ssh.Config
+}
+
+type emulatorOpt func(*emulatorOptions)
+
+// withLegacyAlgorithmsOnly restricts the server to the given key exchange and
+// cipher, mimicking a legacy SFTP server that offers none of the defaults.
+func withLegacyAlgorithmsOnly(kex, cipher string) emulatorOpt {
+	return func(o *emulatorOptions) {
+		o.env["SFTPGO_SFTPD__KEX_ALGORITHMS"] = kex
+		o.env["SFTPGO_SFTPD__CIPHERS"] = cipher
+		o.sshConfig.KeyExchanges = []string{kex}
+		o.sshConfig.Ciphers = []string{cipher}
+	}
+}
+
+func runEmulator(t *testing.T, opts ...emulatorOpt) emulator {
+	adminUsername := "admin"
+	adminPassword := "password"
+
+	options := emulatorOptions{env: map[string]string{
+		"SFTPGO_DATA_PROVIDER__CREATE_DEFAULT_ADMIN": "true",
+		"SFTPGO_DEFAULT_ADMIN_USERNAME":              adminUsername,
+		"SFTPGO_DEFAULT_ADMIN_PASSWORD":              adminPassword,
+	}}
+	for _, opt := range opts {
+		opt(&options)
+	}
+
+	ctr, err := testcontainers.Run(t.Context(), "drakkan/sftpgo:edge-alpine-slim",
+		testcontainers.WithExposedPorts("2022/tcp", "8080/tcp"),
+		testcontainers.WithEnv(options.env),
+		testcontainers.WithWaitStrategy(
+			wait.ForHTTP("/healthz").WithPort("8080/tcp").WithStartupTimeout(30*time.Second),
+		),
+	)
+	testcontainers.CleanupContainer(t, ctr)
+	require.NoError(t, err)
+
+	host, err := ctr.Host(t.Context())
+	require.NoError(t, err)
+	httpPort, err := ctr.MappedPort(t.Context(), "8080/tcp")
+	require.NoError(t, err)
+	sshPort, err := ctr.MappedPort(t.Context(), "2022/tcp")
+	require.NoError(t, err)
+
+	httpAddr := host + ":" + httpPort.Port()
+
+	// Get an access token for the admin user
+	req, err := http.NewRequest(http.MethodGet, "http://"+httpAddr+"/api/v2/token", nil)
+	require.NoError(t, err)
+	req.SetBasicAuth(adminUsername, adminPassword)
+	resp, err := http.DefaultClient.Do(req)
+	require.NoError(t, err)
+	defer resp.Body.Close()
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+	body, err := io.ReadAll(resp.Body)
+	require.NoError(t, err)
+	var tokenResponse struct {
+		AccessToken string `json:"access_token"`
+	}
+	require.NoError(t, json.Unmarshal(body, &tokenResponse))
+	require.NotEmpty(t, tokenResponse.AccessToken)
+
+	// Create a user for SFTP access
+	req, err = http.NewRequest(
+		http.MethodPost,
+		"http://"+httpAddr+"/api/v2/users",
+		strings.NewReader(
+			fmt.Sprintf(
+				`{"id": 1, "status": 1, "username": "%s", "password": "%s", "permissions": {"/": ["*"]}}`,
+				sftpUsername, sftpPassword,
+			),
+		),
+	)
+	require.NoError(t, err)
+	req.Header.Set("Authorization", "Bearer "+tokenResponse.AccessToken)
+	resp, err = http.DefaultClient.Do(req)
+	require.NoError(t, err)
+	defer resp.Body.Close()
+	require.Equal(t, http.StatusCreated, resp.StatusCode)
+
+	address := host + ":" + sshPort.Port()
+	var hostPubKey string
+	var sshClient *ssh.Client
+	require.EventuallyWithT(t, func(c *assert.CollectT) {
+		var pubKey ssh.PublicKey
+		cb := func(_ string, _ net.Addr, key ssh.PublicKey) error {
+			pubKey = key
+			return nil
+		}
+
+		var err error
+		sshClient, err = ssh.Dial("tcp", address, &ssh.ClientConfig{
+			Config:          options.sshConfig,
+			User:            sftpUsername,
+			Auth:            []ssh.AuthMethod{ssh.Password(sftpPassword)},
+			HostKeyCallback: cb,
+			Timeout:         2 * time.Second,
+		})
+		require.NoError(c, err)
+		require.NotEmpty(c, pubKey)
+
+		hostPubKey = string(ssh.MarshalAuthorizedKey(pubKey))
+	}, time.Second*6, time.Millisecond*100)
+
+	client, err := sftp.NewClient(sshClient)
+	require.NoError(t, err)
+
+	t.Cleanup(func() {
+		require.NoError(t, client.Close())
+		require.NoError(t, sshClient.Close())
+	})
+
+	return emulator{
+		client:     client,
+		address:    address,
+		hostKey:    hostPubKey,
+		httpAddr:   httpAddr,
+		adminToken: tokenResponse.AccessToken,
+	}
+}
+
+// writeSFTPFile writes data to a temporary name and then renames it into place.
+// The file appears atomically at its full size, so a watcher poll can never
+// observe a partially written file.
+func writeSFTPFile(t *testing.T, client *sftp.Client, path, data string) {
+	t.Helper()
+	tmpPath := path + ".tmp"
+	file, err := client.Create(tmpPath)
+	require.NoError(t, err, "creating file")
+	_, err = fmt.Fprint(file, data)
+	require.NoError(t, err, "writing file contents")
+	require.NoError(t, file.Close(), "closing file")
+	require.NoError(t, client.Rename(tmpPath, path), "renaming file into place")
+}
+
+// readSFTPInput builds an sftp input for the emulator and connects it.
+func readSFTPInput(t *testing.T, emu emulator, path, scanner string, watcher bool) *sftpReader {
+	t.Helper()
+	conf := fmt.Sprintf(`
+address: %s
+paths:
+  - %s
+credentials:
+  username: %s
+  password: %s
+  host_public_key: %s
+scanner:
+  %s: {}
+watcher:
+  enabled: %t
+  minimum_age: 0s
+  poll_interval: 100ms
+  cache: files_memory
+`, emu.address, path, sftpUsername, sftpPassword, emu.hostKey, scanner, watcher)
+
+	parsed, err := sftpInputSpec().ParseYAML(conf, nil)
+	require.NoError(t, err)
+
+	reader, err := newSFTPReaderFromParsed(parsed, service.MockResources(service.MockResourcesOptAddCache("files_memory")))
+	require.NoError(t, err)
+	require.NoError(t, reader.Connect(t.Context()))
+	t.Cleanup(func() { require.NoError(t, reader.Close(context.Background())) })
+	return reader
+}
+
+// readOneFile reads one batch of exactly one message and acks it.
+// It has no testing.T, so it is safe to be called from the application code/goroutine.
+// Assert on the result from the test goroutine, or use mustReadOneFile.
+func readOneFile(ctx context.Context, reader *sftpReader) (string, error) {
+	batch, ackFn, err := reader.ReadBatch(ctx)
+	if err != nil {
+		return "", err
+	}
+	if len(batch) != 1 {
+		return "", fmt.Errorf("expected a batch of 1 message, got %d", len(batch))
+	}
+	content, err := batch[0].AsBytes()
+	if err != nil {
+		return "", err
+	}
+	if err := ackFn(ctx, nil); err != nil {
+		return "", err
+	}
+	return string(content), nil
+}
+
+// mustReadOneFile reads one file on the test goroutine and fails the test on
+// any error.
+func mustReadOneFile(t *testing.T, ctx context.Context, reader *sftpReader) string {
+	t.Helper()
+	content, err := readOneFile(ctx, reader)
+	require.NoError(t, err, "file boundary must not be reported as a lost connection")
+	return content
+}
+
+func TestIntegrationSFTPReadBatchRotatesFiles(t *testing.T) {
+	integration.CheckSkip(t)
+
+	emu := runEmulator(t)
+	require.NoError(t, emu.client.MkdirAll("/upload"))
+
+	t.Run("static paths", func(t *testing.T) {
+		dir := "/upload/static"
+		require.NoError(t, emu.client.MkdirAll(dir))
+		writeSFTPFile(t, emu.client, dir+"/1.txt", "data-1")
+		writeSFTPFile(t, emu.client, dir+"/2.txt", "data-2")
+		writeSFTPFile(t, emu.client, dir+"/3.txt", "data-3")
+
+		reader := readSFTPInput(t, emu, dir+"/*.txt", "to_the_end", false)
+		ctx := t.Context()
+
+		// A cancelled context must stop the rotation before a file is opened.
+		cancelledCtx, cancel := context.WithCancel(ctx)
+		cancel()
+		_, _, err := reader.ReadBatch(cancelledCtx)
+		require.ErrorIs(t, err, context.Canceled)
+
+		var contents []string
+		for range 3 {
+			contents = append(contents, mustReadOneFile(t, ctx, reader))
+		}
+		// The SFTP server does not sort glob results, so only the set is checked.
+		assert.ElementsMatch(t, []string{"data-1", "data-2", "data-3"}, contents)
+
+		_, _, err = reader.ReadBatch(ctx)
+		require.ErrorIs(t, err, service.ErrEndOfInput)
+	})
+
+	t.Run("empty files", func(t *testing.T) {
+		// With the lines scanner an empty file yields EOF at once. The reader
+		// must skip it inside one ReadBatch call, and an empty last file must
+		// end the input instead of returning an empty batch.
+		dir := "/upload/empty"
+		require.NoError(t, emu.client.MkdirAll(dir))
+		writeSFTPFile(t, emu.client, dir+"/1.txt", "data-1\n")
+		writeSFTPFile(t, emu.client, dir+"/2.txt", "")
+		writeSFTPFile(t, emu.client, dir+"/3.txt", "data-3\n")
+		writeSFTPFile(t, emu.client, dir+"/4.txt", "")
+
+		// Fix the order so the empty files sit where the test expects.
+		// Needed because we want to test that the reader skips empty files, so the order matters.
+		reader := readSFTPInput(t, emu, dir+"/*.txt", "lines", false)
+		reader.pathProvider = &staticPathProvider{expandedPaths: []string{
+			dir + "/1.txt", dir + "/2.txt", dir + "/3.txt", dir + "/4.txt",
+		}}
+		ctx := t.Context()
+
+		var contents []string
+		for {
+			batch, ackFn, err := reader.ReadBatch(ctx)
+			if errors.Is(err, service.ErrEndOfInput) {
+				break
+			}
+			require.NotErrorIs(t, err, service.ErrNotConnected)
+			require.NoError(t, err)
+			require.NotEmpty(t, batch, "ReadBatch must not return an empty batch")
+			for _, msg := range batch {
+				content, err := msg.AsBytes()
+				require.NoError(t, err)
+				contents = append(contents, string(content))
+			}
+			require.NoError(t, ackFn(ctx, nil))
+		}
+		assert.Equal(t, []string{"data-1", "data-3"}, contents)
+	})
+
+	t.Run("cancel mid rotation", func(t *testing.T) {
+		// A shutdown while the reader works through a run of empty files
+		// must stop the rotation at once, not drain the remaining files.
+		dir := "/upload/cancel"
+		require.NoError(t, emu.client.MkdirAll(dir))
+		writeSFTPFile(t, emu.client, dir+"/empty.txt", "")
+
+		ctx, cancel := context.WithCancel(t.Context())
+		defer cancel()
+
+		const (
+			totalFiles   = 10
+			cancelAtFile = 3
+		)
+		provider := &countingPathProvider{path: dir + "/empty.txt", total: totalFiles}
+		provider.onNext = func(calls int) {
+			if calls == cancelAtFile {
+				cancel()
+			}
+		}
+
+		reader := readSFTPInput(t, emu, dir+"/*.txt", "lines", false)
+		reader.pathProvider = provider
+
+		_, _, err := reader.ReadBatch(ctx)
+		require.ErrorIs(t, err, context.Canceled)
+		assert.Equal(t, cancelAtFile, provider.calls)
+	})
+
+	t.Run("watcher", func(t *testing.T) {
+		dir := "/upload/watcher"
+		require.NoError(t, emu.client.MkdirAll(dir))
+		writeSFTPFile(t, emu.client, dir+"/1.txt", "data-1")
+		writeSFTPFile(t, emu.client, dir+"/2.txt", "data-2")
+
+		reader := readSFTPInput(t, emu, dir+"/*.txt", "to_the_end", true)
+		ctx, cancel := context.WithCancel(t.Context())
+		defer cancel()
+
+		var contents []string
+		for range 2 {
+			contents = append(contents, mustReadOneFile(t, ctx, reader))
+		}
+		assert.ElementsMatch(t, []string{"data-1", "data-2"}, contents)
+
+		// The watcher waits for a new file. It must not end the input.
+		type readResult struct {
+			content string
+			err     error
+		}
+		results := make(chan readResult, 1)
+		go func() {
+			content, err := readOneFile(ctx, reader)
+			results <- readResult{content: content, err: err}
+		}()
+		select {
+		case res := <-results:
+			t.Fatalf("watcher returned (%q, %v) before a new file was written", res.content, res.err)
+		case <-time.After(500 * time.Millisecond):
+		}
+
+		writeSFTPFile(t, emu.client, dir+"/3.txt", "data-3")
+		select {
+		case res := <-results:
+			require.NoError(t, res.err, "file boundary must not be reported as a lost connection")
+			assert.Equal(t, "data-3", res.content)
+		case <-time.After(5 * time.Second):
+			t.Fatal("watcher did not pick up the new file")
+		}
+
+		// A shutdown must unblock the waiting watcher.
+		errs := make(chan error, 1)
+		go func() {
+			_, _, err := reader.ReadBatch(ctx)
+			errs <- err
+		}()
+		cancel()
+		select {
+		case err := <-errs:
+			require.ErrorIs(t, err, context.Canceled)
+		case <-time.After(5 * time.Second):
+			t.Fatal("watcher did not stop on context cancel")
+		}
+	})
+}
+
+// countingPathProvider returns the same path a fixed number of times and
+// counts the calls. It caps the run so a test cannot loop for ever.
+type countingPathProvider struct {
+	path   string
+	total  int
+	calls  int
+	onNext func(calls int)
+}
+
+func (c *countingPathProvider) Next(context.Context) (fileInfo, bool, error) {
+	if c.calls >= c.total {
+		return fileInfo{}, false, nil
+	}
+	c.calls++
+	c.onNext(c.calls)
+	return fileInfo{path: c.path}, true, nil
+}
+
+func (*countingPathProvider) Ack(context.Context, fileInfo, error) error {
+	return nil
+}
+
+// TestIntegrationSFTPWatcherModTimeRecordedFromPoll checks that in
+// path_and_mod_time mode the ack records the modification time seen by the
+// poll, not the one seen when the file was opened. Modification times have
+// one-second resolution, so a writer can change a file again within the second
+// in which it was opened. Recording the open-time value would make every later
+// poll skip the file and lose that change.
+func TestIntegrationSFTPWatcherModTimeRecordedFromPoll(t *testing.T) {
+	integration.CheckSkip(t)
+
+	emu := runEmulator(t)
+	dir := "/upload/modtime"
+	require.NoError(t, emu.client.MkdirAll(dir))
+	path := dir + "/a.txt"
+
+	// The times are set explicitly so the test does not depend on timing.
+	now := time.Now().Truncate(time.Second)
+	polledTime := now.Add(-time.Hour)
+	openedTime := now.Add(-30 * time.Minute)
+
+	writeSFTPFile(t, emu.client, path, "v1")
+	require.NoError(t, emu.client.Chtimes(path, polledTime, polledTime))
+
+	reader := readSFTPInput(t, emu, dir+"/*.txt", "to_the_end", true)
+	reader.pathProvider = &hookPathProvider{
+		inner: &watcherPathProvider{
+			clientPool:   reader.sftpClientPool,
+			mgr:          reader.mgr,
+			cacheName:    reader.watcherCache,
+			pollInterval: reader.watcherPollInterval,
+			targetPaths:  reader.paths,
+			cacheMode:    watcherCacheModePathAndModTime,
+		},
+		// A writer changes the file after the poll queued it and before the
+		// reader opens it.
+		afterNext: func(fileInfo) {
+			writeSFTPFile(t, emu.client, path, "v2")
+			require.NoError(t, emu.client.Chtimes(path, openedTime, openedTime))
+		},
+	}
+	ctx := t.Context()
+
+	batch, ackFn, err := reader.ReadBatch(ctx)
+	require.NoError(t, err)
+	require.Len(t, batch, 1)
+	content, err := batch[0].AsBytes()
+	require.NoError(t, err)
+	assert.Equal(t, "v2", string(content))
+
+	// The metadata still describes the version that was read.
+	modTime, ok := batch[0].MetaGetMut("sftp_mod_time")
+	require.True(t, ok)
+	require.IsType(t, time.Time{}, modTime)
+	assert.True(t, openedTime.Equal(modTime.(time.Time)), "sftp_mod_time = %v, want %v", modTime, openedTime)
+
+	// The writer changes the file again in the same second it was opened, so
+	// its modification time does not change.
+	writeSFTPFile(t, emu.client, path, "v2+more")
+	require.NoError(t, emu.client.Chtimes(path, openedTime, openedTime))
+	require.NoError(t, ackFn(ctx, nil))
+
+	type readResult struct {
+		content string
+		err     error
+	}
+	results := make(chan readResult, 1)
+	go func() {
+		content, err := readOneFile(ctx, reader)
+		results <- readResult{content: content, err: err}
+	}()
+	select {
+	case res := <-results:
+		require.NoError(t, res.err)
+		assert.Equal(t, "v2+more", res.content)
+	case <-time.After(5 * time.Second):
+		t.Fatal("watcher did not consume the change made in the second the file was opened")
+	}
+}
+
+// hookPathProvider wraps a pathProvider and runs afterNext once, after the
+// first path is returned and before the reader opens it.
+type hookPathProvider struct {
+	inner     pathProvider
+	afterNext func(fileInfo)
+}
+
+func (h *hookPathProvider) Next(ctx context.Context) (fileInfo, bool, error) {
+	info, ok, err := h.inner.Next(ctx)
+	if ok && err == nil && h.afterNext != nil {
+		h.afterNext(info)
+		h.afterNext = nil
+	}
+	return info, ok, err
+}
+
+func (h *hookPathProvider) Ack(ctx context.Context, info fileInfo, err error) error {
+	return h.inner.Ack(ctx, info, err)
+}

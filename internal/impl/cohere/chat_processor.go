@@ -1,0 +1,559 @@
+// Copyright 2024 Redpanda Data, Inc.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//    http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package cohere
+
+import (
+	"bytes"
+	"context"
+	"errors"
+	"fmt"
+	"math"
+	"slices"
+	"time"
+	"unicode/utf8"
+
+	cohere "github.com/cohere-ai/cohere-go/v2"
+
+	"github.com/redpanda-data/benthos/v4/public/service"
+
+	"github.com/redpanda-data/connect/v4/internal/impl/confluent/sr"
+	"github.com/redpanda-data/connect/v4/internal/llm"
+	"github.com/redpanda-data/connect/v4/internal/schemaregistry"
+)
+
+const (
+	ccpFieldUserPrompt       = "prompt"
+	ccpFieldSystemPrompt     = "system_prompt"
+	ccpFieldMaxTokens        = "max_tokens"
+	ccpFieldTemp             = "temperature"
+	ccpFieldTopP             = "top_p"
+	ccpFieldSeed             = "seed"
+	ccpFieldStop             = "stop"
+	ccpFieldPresencePenalty  = "presence_penalty"
+	ccpFieldFrequencyPenalty = "frequency_penalty"
+	ccpFieldResponseFormat   = "response_format"
+	ccpFieldMaxToolCalls     = "max_tool_calls"
+	// JSON schema fields
+	ccpFieldJSONSchema = "json_schema"
+	// Schema registry fields
+	ccpFieldSchemaRegistry                = "schema_registry"
+	ccpFieldSchemaRegistrySubject         = "subject"
+	ccpFieldSchemaRegistryRefreshInterval = "refresh_interval"
+	ccpFieldSchemaRegistryURL             = "url"
+	ccpFieldSchemaRegistryTLS             = "tls"
+	// Tool options
+	ccpFieldTools                    = "tools"
+	ccpToolFieldName                 = "name"
+	ccpToolFieldDesc                 = "description"
+	ccpToolFieldParams               = "parameters"
+	ccpToolParamFieldRequired        = "required"
+	ccpToolParamFieldProps           = "properties"
+	ccpToolParamPropFieldType        = "type"
+	ccpToolParamPropFieldDescription = "description"
+	ccpToolParamPropFieldEnum        = "enum"
+	ccpToolFieldPipeline             = "processors"
+)
+
+type pipelineTool struct {
+	tool       cohere.ToolV2
+	processors []*service.OwnedProcessor
+}
+
+func init() {
+	service.MustRegisterProcessor(
+		"cohere_chat",
+		chatProcessorConfig(),
+		makeChatProcessor,
+	)
+}
+
+func chatProcessorConfig() *service.ConfigSpec {
+	return service.NewConfigSpec().
+		Categories("AI").
+		Summary("Generates responses to messages in a chat conversation, using the Cohere API.").
+		Description(`
+This processor sends the contents of user prompts to the Cohere API, which generates responses. By default, the processor submits the entire payload of each message as a string, unless you use the `+"`"+ccpFieldUserPrompt+"`"+` configuration field to customize it.
+
+The model can also call external tools that you define in the `+"`"+ccpFieldTools+"`"+` field, and uses their results as supplementary context when it generates a response.
+
+To learn more about chat completion, see the https://docs.cohere.com/docs/chat-api[Cohere API documentation^].`).
+		Version("4.37.0").
+		Fields(
+			baseConfigFieldsWithModels(
+				"command-r-plus",
+				"command-r",
+				"command",
+				"command-light",
+			)...,
+		).
+		Fields(
+			llm.PromptField(ccpFieldUserPrompt).
+				Optional(),
+			llm.SystemPromptField(ccpFieldSystemPrompt).
+				Optional(),
+			service.NewIntField(ccpFieldMaxTokens).
+				Optional().
+				Description("The maximum number of tokens to allow in the chat completion."),
+			service.NewFloatField(ccpFieldTemp).
+				Optional().
+				Description("The sampling temperature, between `0` and `2`, that tunes the randomness of the generated text. Lower values make the output more focused and deterministic, and higher values make it more random. If you don't set this field, the Cohere API uses its default of `0.3`. To increase randomness further, also raise `top_p`.").
+				ShortDescription("Sampling temperature between 0 and 2. Higher values make output more random, lower more deterministic.").
+				LintRule(`root = if this > 2 || this < 0 { [ "field must be between 0 and 2" ] }`),
+			service.NewStringEnumField(ccpFieldResponseFormat, "text", "json", "json_schema").
+				Default("text").
+				Description("Choose the model's output format. If `json_schema` is specified, then you must also configure a `json_schema` or `schema_registry`.").
+				ShortDescription("The model's output format. json_schema additionally requires json_schema or schema_registry."),
+			service.NewStringField(ccpFieldJSONSchema).
+				Optional().
+				Description("The JSON schema to use when responding in `json_schema` format. To learn more about the JSON schema features supported, see the https://docs.cohere.com/docs/structured-outputs-json[Cohere documentation^].").
+				ShortDescription("The JSON schema to use when responding in json_schema format."),
+			service.NewObjectField(
+				ccpFieldSchemaRegistry,
+				slices.Concat(
+					[]*service.ConfigField{
+						service.NewURLField(ccpFieldSchemaRegistryURL).Description(schemaregistry.URLFieldDescription),
+						service.NewStringField(ccpFieldSchemaRegistrySubject).
+							Description("The subject name to fetch the schema for."),
+						service.NewDurationField(ccpFieldSchemaRegistryRefreshInterval).
+							Optional().
+							Description("The refresh rate for fetching the latest schema. If not specified the schema does not refresh."),
+						service.NewTLSField(ccpFieldSchemaRegistryTLS),
+					},
+					service.NewHTTPRequestAuthSignerFields(),
+				)...,
+			).
+				Description("The schema registry to dynamically load schemas from when responding in `json_schema` format. Schemas themselves must be in JSON format. To learn more about the JSON schema features supported, see the https://docs.cohere.com/docs/structured-outputs-json[Cohere documentation^].").
+				ShortDescription("Schema registry to load schemas from when responding in json_schema format. Schemas must be JSON.").
+				Optional().
+				Advanced(),
+			service.NewFloatField(ccpFieldTopP).
+				Optional().
+				Advanced().
+				Description("Nucleus sampling, sent to the Cohere API as the `p` parameter. The model considers only the most likely tokens whose total probability mass is `top_p`. The Cohere API accepts values from `0.01` to `0.99`, and uses `0.75` if you don't set this field.").
+				ShortDescription("Nucleus sampling: the model considers only tokens making up the top_p probability mass.").
+				LintRule(`root = if this > 1 || this < 0 { [ "field must be between 0 and 1" ] }`),
+			service.NewFloatField(ccpFieldFrequencyPenalty).
+				Optional().
+				Advanced().
+				Description("A number between `0.0` and `1.0`. Higher values penalize new tokens more strongly based on the frequency of their appearance in the prompt and the text so far. This decreases the model's likelihood to repeat the same line verbatim.").
+				ShortDescription("Between 0.0 and 1.0. Higher values penalize frequent tokens, reducing verbatim repetition.").
+				LintRule(`root = if this > 1 || this < 0 { [ "field must be between 0 and 1" ] }`),
+			service.NewFloatField(ccpFieldPresencePenalty).
+				Optional().
+				Advanced().
+				Description("A number between `0.0` and `1.0`. Higher values penalize new tokens more strongly if they have already appeared in the prompt or the text so far, regardless of how often. This increases the model's likelihood to talk about new topics.").
+				ShortDescription("Between 0.0 and 1.0. Higher values encourage the model to raise new topics.").
+				LintRule(`root = if this > 1 || this < 0 { [ "field must be between 0 and 1" ] }`),
+			service.NewIntField(ccpFieldSeed).
+				Advanced().
+				Optional().
+				Description("If specified, the Cohere API makes a best effort to sample deterministically. Repeated requests with the same seed and parameters should return the same result. Determinism is not guaranteed.").
+				ShortDescription("Sample deterministically on a best-effort basis, so repeated requests with the same seed match."),
+			service.NewStringListField(ccpFieldStop).
+				Optional().
+				Advanced().
+				Description("Specify up to five sequences to stop the API from generating further tokens."),
+			service.NewIntField(ccpFieldMaxToolCalls).Description("The maximum number of tool calls the model can perform.").Version("4.53.0").Default(10),
+			service.NewObjectListField(
+				ccpFieldTools,
+				llm.ToolFields(llm.ToolParametersField())...,
+			).Description("External tools that the model can invoke, such as functions, APIs, or web browsing. You can define subpipelines of processors that implement these tools, enabling the model to use agent-like behavior to decide when and how to invoke them to enhance response generation.").Version("4.53.0").
+				ShortDescription("The tools the LLM may invoke, allowing subpipelines to be called for agentic actions.").Default([]any{}),
+		).LintRule(`
+      root = match {
+        this.exists("` + ccpFieldJSONSchema + `") && this.exists("` + ccpFieldSchemaRegistry + `") => ["cannot set both ` + "`" + ccpFieldJSONSchema + "`" + ` and ` + "`" + ccpFieldSchemaRegistry + "`" + `"]
+        this.response_format == "json_schema" && !this.exists("` + ccpFieldJSONSchema + `") && !this.exists("` + ccpFieldSchemaRegistry + `") => ["schema must be specified using either ` + "`" + ccpFieldJSONSchema + "`" + ` or ` + "`" + ccpFieldSchemaRegistry + "`" + `"]
+      }
+    `)
+}
+
+func makeChatProcessor(conf *service.ParsedConfig, mgr *service.Resources) (service.Processor, error) {
+	b, err := newBaseProcessor(conf)
+	if err != nil {
+		return nil, err
+	}
+	var up *service.InterpolatedString
+	if conf.Contains(ccpFieldUserPrompt) {
+		up, err = conf.FieldInterpolatedString(ccpFieldUserPrompt)
+		if err != nil {
+			return nil, err
+		}
+	}
+	var sp *service.InterpolatedString
+	if conf.Contains(ccpFieldSystemPrompt) {
+		sp, err = conf.FieldInterpolatedString(ccpFieldSystemPrompt)
+		if err != nil {
+			return nil, err
+		}
+	}
+	var maxTokens *int
+	if conf.Contains(ccpFieldMaxTokens) {
+		mt, err := conf.FieldInt(ccpFieldMaxTokens)
+		if err != nil {
+			return nil, err
+		}
+		maxTokens = &mt
+	}
+	var temp *float64
+	if conf.Contains(ccpFieldTemp) {
+		ft, err := conf.FieldFloat(ccpFieldTemp)
+		if err != nil {
+			return nil, err
+		}
+		temp = &ft
+	}
+	var topP *float64
+	if conf.Contains(ccpFieldTopP) {
+		v, err := conf.FieldFloat(ccpFieldTopP)
+		if err != nil {
+			return nil, err
+		}
+		topP = &v
+	}
+	var frequencyPenalty *float64
+	if conf.Contains(ccpFieldFrequencyPenalty) {
+		v, err := conf.FieldFloat(ccpFieldFrequencyPenalty)
+		if err != nil {
+			return nil, err
+		}
+		frequencyPenalty = &v
+	}
+	var presencePenalty *float64
+	if conf.Contains(ccpFieldPresencePenalty) {
+		v, err := conf.FieldFloat(ccpFieldPresencePenalty)
+		if err != nil {
+			return nil, err
+		}
+		presencePenalty = &v
+	}
+	var seed *int
+	if conf.Contains(ccpFieldSeed) {
+		intSeed, err := conf.FieldInt(ccpFieldSeed)
+		if err != nil {
+			return nil, err
+		}
+		seed = &intSeed
+	}
+	var stop []string
+	if conf.Contains(ccpFieldStop) {
+		stop, err = conf.FieldStringList(ccpFieldStop)
+		if err != nil {
+			return nil, err
+		}
+	}
+	v, err := conf.FieldString(ccpFieldResponseFormat)
+	if err != nil {
+		return nil, err
+	}
+	var responseFormat cohere.ResponseFormatV2
+	var schemaProvider jsonSchemaProvider
+	switch v {
+	case "json":
+		fallthrough
+	case "json_object":
+		responseFormat.Type = "json_object"
+	case "json_schema":
+		responseFormat.Type = "json_object"
+		responseFormat.JsonObject = &cohere.JsonResponseFormatV2{}
+		if conf.Contains(ccpFieldJSONSchema) {
+			schemaProvider, err = newFixedSchemaProvider(conf)
+			if err != nil {
+				return nil, err
+			}
+		} else if conf.Contains(ccpFieldSchemaRegistry) {
+			schemaProvider, err = newDynamicSchemaProvider(conf.Namespace(ccpFieldSchemaRegistry), mgr)
+			if err != nil {
+				return nil, err
+			}
+		} else {
+			return nil, fmt.Errorf("using %s %q, but did not specify %s or %s", ccpFieldResponseFormat, v, ccpFieldJSONSchema, ccpFieldSchemaRegistry)
+		}
+	case "text":
+		responseFormat.Type = "text"
+		responseFormat.Text = &cohere.ChatTextResponseFormatV2{}
+	default:
+		return nil, fmt.Errorf("unknown %s: %q", ccpFieldResponseFormat, v)
+	}
+	var tools []pipelineTool
+	confTools, err := conf.FieldObjectList(ccpFieldTools)
+	if err != nil {
+		return nil, err
+	}
+	for _, toolConf := range confTools {
+		name, err := toolConf.FieldString(ccpToolFieldName)
+		if err != nil {
+			return nil, err
+		}
+		desc, err := toolConf.FieldString(ccpToolFieldDesc)
+		if err != nil {
+			return nil, err
+		}
+		required, err := toolConf.FieldStringList(ccpToolFieldParams, ccpToolParamFieldRequired)
+		if err != nil {
+			return nil, err
+		}
+		paramsConf, err := toolConf.FieldObjectMap(ccpToolFieldParams, ccpToolParamFieldProps)
+		if err != nil {
+			return nil, err
+		}
+		params := map[string]any{}
+		for paramName, paramConf := range paramsConf {
+			paramType, err := paramConf.FieldString(ccpToolParamPropFieldType)
+			if err != nil {
+				return nil, err
+			}
+			param := map[string]any{
+				"type": paramType,
+			}
+
+			desc, err := paramConf.FieldString(ccpToolParamPropFieldDescription)
+			if err != nil {
+				return nil, err
+			}
+			if desc != "" {
+				param["description"] = desc
+			}
+			enum, err := paramConf.FieldStringList(ccpToolParamPropFieldEnum)
+			if err != nil {
+				return nil, err
+			}
+			if len(enum) > 0 {
+				param["enum"] = enum
+			}
+			params[paramName] = param
+		}
+		tool := cohere.ToolV2{
+			Function: &cohere.ToolV2Function{
+				Name:        name,
+				Description: &desc,
+				Parameters: map[string]any{
+					"type":       "object",
+					"required":   required,
+					"properties": params,
+				},
+			},
+		}
+		processors, err := toolConf.FieldProcessorList(ccpToolFieldPipeline)
+		if err != nil {
+			return nil, err
+		}
+		tools = append(tools, pipelineTool{
+			tool:       tool,
+			processors: processors,
+		})
+	}
+	maxToolCalls, err := conf.FieldInt(ccpFieldMaxToolCalls)
+	if err != nil {
+		return nil, err
+	}
+	return &chatProcessor{b, up, sp, maxTokens, temp, topP, frequencyPenalty, presencePenalty, seed, stop, responseFormat, schemaProvider, tools, maxToolCalls}, nil
+}
+
+func newFixedSchemaProvider(conf *service.ParsedConfig) (jsonSchemaProvider, error) {
+	schema, err := conf.FieldString(ccpFieldJSONSchema)
+	if err != nil {
+		return nil, err
+	}
+	return newFixedSchema(schema)
+}
+
+func newDynamicSchemaProvider(conf *service.ParsedConfig, mgr *service.Resources) (jsonSchemaProvider, error) {
+	url, err := conf.FieldString(ccpFieldSchemaRegistryURL)
+	if err != nil {
+		return nil, err
+	}
+	reqSigner, err := conf.HTTPRequestAuthSignerFromParsed()
+	if err != nil {
+		return nil, err
+	}
+	tlsConfig, err := conf.FieldTLS(ccpFieldSchemaRegistryTLS)
+	if err != nil {
+		return nil, err
+	}
+	client, err := sr.NewClient(url, reqSigner, tlsConfig, mgr)
+	if err != nil {
+		return nil, fmt.Errorf("unable to create schema registry client: %w", err)
+	}
+	subject, err := conf.FieldString(ccpFieldSchemaRegistrySubject)
+	if err != nil {
+		return nil, err
+	}
+	var refreshInterval time.Duration = math.MaxInt64
+	if conf.Contains(ccpFieldSchemaRegistryRefreshInterval) {
+		refreshInterval, err = conf.FieldDuration(ccpFieldSchemaRegistryRefreshInterval)
+		if err != nil {
+			return nil, err
+		}
+	}
+	return newDynamicSchema(client, subject, refreshInterval), nil
+}
+
+type chatProcessor struct {
+	*baseProcessor
+
+	userPrompt       *service.InterpolatedString
+	systemPrompt     *service.InterpolatedString
+	maxTokens        *int
+	temperature      *float64
+	topP             *float64
+	frequencyPenalty *float64
+	presencePenalty  *float64
+	seed             *int
+	stop             []string
+	responseFormat   cohere.ResponseFormatV2
+	schemaProvider   jsonSchemaProvider
+	tools            []pipelineTool
+	maxToolCalls     int
+}
+
+func (p *chatProcessor) Process(ctx context.Context, msg *service.Message) (service.MessageBatch, error) {
+	var body cohere.V2ChatRequest
+	body.Model = p.model
+	body.MaxTokens = p.maxTokens
+	body.Temperature = p.temperature
+	body.P = p.topP
+	body.Seed = p.seed
+	body.FrequencyPenalty = p.frequencyPenalty
+	body.PresencePenalty = p.presencePenalty
+	body.ResponseFormat = &p.responseFormat
+	if p.schemaProvider != nil {
+		s, err := p.schemaProvider.GetJSONSchema(ctx)
+		if err != nil {
+			return nil, err
+		}
+		body.ResponseFormat.JsonObject.JsonSchema = s
+	}
+	body.StopSequences = p.stop
+	if p.systemPrompt != nil {
+		s, err := p.systemPrompt.TryString(msg)
+		if err != nil {
+			return nil, fmt.Errorf("%s interpolation error: %w", ccpFieldSystemPrompt, err)
+		}
+		body.Messages = append(body.Messages, &cohere.ChatMessageV2{
+			Role:   "system",
+			System: &cohere.SystemMessageV2{Content: &cohere.SystemMessageV2Content{String: s}},
+		})
+	}
+	if p.userPrompt != nil {
+		s, err := p.userPrompt.TryString(msg)
+		if err != nil {
+			return nil, fmt.Errorf("%s interpolation error: %w", ccpFieldUserPrompt, err)
+		}
+		body.Messages = append(body.Messages, &cohere.ChatMessageV2{
+			Role: "user",
+			User: &cohere.UserMessageV2{Content: &cohere.UserMessageV2Content{String: s}},
+		})
+	} else {
+		b, err := msg.AsBytes()
+		if err != nil {
+			return nil, err
+		}
+		body.Messages = append(body.Messages, &cohere.ChatMessageV2{
+			Role: "user",
+			User: &cohere.UserMessageV2{Content: &cohere.UserMessageV2Content{String: string(b)}},
+		})
+	}
+	for _, tool := range p.tools {
+		body.Tools = append(body.Tools, &tool.tool)
+	}
+	var err error
+	var resp *cohere.V2ChatResponse
+	for i := 0; i <= p.maxToolCalls; i++ {
+		if i == p.maxToolCalls {
+			body.Tools = nil // Disallow tools
+		}
+		resp, err = p.client.Chat(ctx, &body)
+		if err != nil {
+			return nil, fmt.Errorf("error calling Cohere API: %w", err)
+		}
+		if len(resp.Message.ToolCalls) == 0 {
+			break
+		}
+		for _, tool := range resp.Message.ToolCalls {
+			if tool.Id == "" {
+				return nil, errors.New("tool call has no ID")
+			}
+			if tool.Function == nil || tool.Function.Name == nil {
+				return nil, errors.New("tool call has no function name")
+			}
+			// Fix a bug in cohere API when the function arguments are null, it expects a valid JSON object in the response.
+			if tool.Function.Arguments == nil || *tool.Function.Arguments == "null" {
+				tool.Function.Arguments = new(`{}`)
+			}
+		}
+		body.Messages = append(body.Messages, &cohere.ChatMessageV2{
+			Role: resp.Message.Role(),
+			Assistant: &cohere.AssistantMessage{
+				ToolCalls: resp.Message.ToolCalls,
+				ToolPlan:  resp.Message.ToolPlan,
+			},
+		})
+		for _, tool := range resp.Message.ToolCalls {
+			name := *tool.Function.Name
+			idx := slices.IndexFunc(p.tools, func(t pipelineTool) bool { return t.tool.Function.Name == name })
+			if idx < 0 {
+				return nil, fmt.Errorf("unknown called tool: %q", name)
+			}
+			toolCallMsg := service.NewMessage(nil)
+			if tool.Function.Arguments != nil {
+				toolCallMsg.SetBytes([]byte(*tool.Function.Arguments))
+			}
+			batches, err := service.ExecuteProcessors(
+				ctx,
+				p.tools[idx].processors,
+				service.MessageBatch{toolCallMsg},
+			)
+			if err != nil {
+				return nil, fmt.Errorf("error executing tool %q: %w", name, err)
+			}
+			batch := slices.Concat(batches...)
+			outputs := []*cohere.ToolContent{}
+			for _, m := range batch {
+				if err := m.GetError(); err != nil {
+					return nil, fmt.Errorf("error executing tool %q: %w", name, err)
+				}
+				v, err := m.AsBytes()
+				if err != nil {
+					return nil, fmt.Errorf("error converting tool %q output to structured: %w", name, err)
+				}
+				if !utf8.Valid(v) {
+					return nil, fmt.Errorf("tool %q output is not valid UTF-8", name)
+				}
+				outputs = append(outputs, &cohere.ToolContent{
+					Type: "text",
+					Text: &cohere.ChatTextContent{Text: string(v)},
+				})
+			}
+			body.Messages = append(body.Messages, &cohere.ChatMessageV2{
+				Role: "tool",
+				Tool: &cohere.ToolMessageV2{
+					ToolCallId: tool.Id,
+					Content: &cohere.ToolMessageV2Content{
+						ToolContentList: outputs,
+					},
+				},
+			})
+		}
+	}
+	buf := bytes.NewBuffer(nil)
+	for _, content := range resp.Message.Content {
+		if content.Type == "text" && content.Text != nil {
+			_, _ = buf.WriteString(content.Text.Text)
+		}
+	}
+	msg = msg.Copy()
+	msg.SetBytes(buf.Bytes())
+	return service.MessageBatch{msg}, nil
+}

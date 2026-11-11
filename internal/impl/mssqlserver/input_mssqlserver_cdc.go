@@ -1,0 +1,664 @@
+// Copyright 2025 Redpanda Data, Inc.
+//
+// Licensed as a Redpanda Enterprise file under the Redpanda Community
+// License (the "License"); you may not use this file except in compliance with
+// the License. You may obtain a copy of the License at
+//
+// https://github.com/redpanda-data/connect/blob/main/licenses/rcl.md
+
+package mssqlserver
+
+import (
+	"bytes"
+	"context"
+	"database/sql"
+	"errors"
+	"fmt"
+	"regexp"
+	"sync"
+	"sync/atomic"
+	"time"
+
+	"github.com/Jeffail/checkpoint"
+	"github.com/Jeffail/shutdown"
+	"golang.org/x/sync/errgroup"
+
+	"github.com/redpanda-data/benthos/v4/public/service"
+	"github.com/redpanda-data/connect/v4/internal/confx"
+	"github.com/redpanda-data/connect/v4/internal/impl/mssqlserver/replication"
+	"github.com/redpanda-data/connect/v4/internal/license"
+	cdcreplication "github.com/redpanda-data/connect/v4/internal/replication"
+)
+
+const (
+	fieldConnectionString                = "connection_string"
+	fieldStreamSnapshot                  = "stream_snapshot"
+	fieldMaxParallelSnapshotTables       = "max_parallel_snapshot_tables"
+	fieldSnapshotMaxBatchSize            = "snapshot_max_batch_size"
+	fieldStreamBackoffInterval           = "stream_backoff_interval"
+	fieldTablesExclude                   = "exclude"
+	fieldTablesInclude                   = "include"
+	fieldCheckpointLimit                 = "checkpoint_limit"
+	fieldCheckpointCache                 = "checkpoint_cache"
+	fieldCheckpointCacheKey              = "checkpoint_cache_key"
+	fieldCheckpointCacheTableName        = "checkpoint_cache_table_name"
+	fieldCheckpointCacheConnectionString = "checkpoint_cache_connection_string"
+	fieldBatching                        = "batching"
+
+	shutdownTimeout = 5 * time.Second
+)
+
+func init() {
+	service.MustRegisterBatchInput("microsoft_sql_server_cdc", msSQLServerStreamConfigSpec, newMSSQLServerCDCInput)
+}
+
+var msSQLServerStreamConfigSpec = service.NewConfigSpec().
+	Stable().
+	Categories("Services").
+	Version("4.66.1").
+	Summary("Enables Change Data Capture by consuming from Microsoft SQL Server's change tables.").
+	Description(`Streams changes from a Microsoft SQL Server database for Change Data Capture (CDC).
+Additionally, if ` + "`" + fieldStreamSnapshot + "`" + ` is set to true, then the existing data in the database is also streamed too.
+
+== Metadata
+
+This input adds the following metadata fields to each message:
+- ` + "`database_schema`" + ` (The database schema for the table where the message originates from)
+- ` + "`schema`" + ` (The table schema in benthos common schema format, compatible with processors like ` + "`parquet_encode`" + `)
+- ` + "`table`" + ` (Name of the table that the message originated from)
+- ` + "`operation`" + ` (Type of operation that generated the message: ` + "`read`" + `, ` + "`delete`" + `, ` + "`insert`" + `, or ` + "`update_before`" + ` and ` + "`update_after`" + `. ` + "`read`" + ` is from messages that are read in the initial snapshot phase.)
+- ` + "`lsn`" + ` (The commit Log Sequence Number of the change, from the change table column ` + "`__$start_lsn`" + `. Not present on snapshot (` + "`read`" + `) messages.)
+- ` + "`seqval`" + ` (The position of the change in the transaction log, from the change table column ` + "`__$seqval`" + `, as a hexadecimal string with a ` + "`0x`" + ` prefix. Not present on snapshot (` + "`read`" + `) messages.)
+- ` + "`command_id`" + ` (The order of the statement within its transaction, from the change table column ` + "`__$command_id`" + `. Not present on snapshot (` + "`read`" + `) messages.)
+
+== Ordering
+
+Change messages are emitted in the order SQL Server recorded them: by ` + "`lsn`" + ` first, then by ` + "`command_id`" + `.
+All rows of one transaction share one ` + "`lsn`" + `, so ` + "`lsn`" + ` alone does not order changes inside a transaction. Use ` + "`command_id`" + ` for that.
+
+The ` + "`update_before`" + ` and ` + "`update_after`" + ` rows of one ` + "`UPDATE`" + ` statement share ` + "`lsn`" + `, ` + "`seqval`" + ` and ` + "`command_id`" + `.
+Use ` + "`operation`" + ` to tell them apart: ` + "`update_before`" + ` is always emitted first.
+
+== Permissions
+
+When using the default Microsoft SQL Server based cache, the Connect user requires permission to create tables and stored procedures. The ` + "`rpcn`" + ` schema must also already exist. Refer to <<` + fieldCheckpointCacheTableName + `,` + "`" + fieldCheckpointCacheTableName + "`" + `>> for more information.
+
+When ` + "`" + fieldStreamSnapshot + "`" + ` is ` + "`true`" + `, the database must allow snapshot isolation, because each table is snapshotted in a transaction at ` + "`SNAPSHOT`" + ` isolation so that its rows are read as one consistent view. Enable it with ` + "`ALTER DATABASE <database> SET ALLOW_SNAPSHOT_ISOLATION ON`" + `, which requires ` + "`ALTER`" + ` permission on the database. Otherwise the snapshot fails with an error such as ` + "`Snapshot isolation transaction failed accessing database ... because snapshot isolation is not allowed in this database`" + `. This setting is separate from ` + "`READ_COMMITTED_SNAPSHOT`" + ` and does not change the isolation level of other sessions, but SQL Server then keeps row versions in ` + "`tempdb`" + ` for updates and deletes. Streaming from the change tables does not need it.
+
+== Performance
+
+This input does not read the transaction log directly: SQL Server's CDC capture job scans the log asynchronously and publishes rows into per-table change tables, which this input polls. The capture job is an upstream throughput ceiling shared by every CDC consumer. Delivery is inherently bursty: short idle periods followed by large batches are normal under heavy write load. This reflects the capture job's publication cadence, not this input. Under sustained load the practical ceiling is usually the database server's storage bandwidth rather than CPU. CDC multiplies physical write volume several times over across the base table, transaction log, change tables and checkpoints. The input itself needs very little CPU to keep pace with the capture job.
+
+Operational notes:
+
+- ` + "`TRUNCATE TABLE`" + ` is rejected on a CDC-enabled table. To clear one, disable CDC on the table, truncate, then re-enable.
+- On AWS RDS, enable CDC with ` + "`msdb.dbo.rds_cdc_enable_db`" + `: ` + "`sys.sp_cdc_enable_db`" + ` requires sysadmin, which RDS does not grant.
+- Do not stop the CDC capture job (` + "`cdc.<database>_capture`" + `): while it is stopped nothing is published to the change tables, so this input reads nothing and reports no error.
+		`).
+	Field(service.NewStringField(fieldConnectionString).
+		Description("The connection string for the Microsoft SQL Server database. Use the format `sqlserver://username:password@host/instance?param1=value&param2=value`. For Windows Authentication, use `sqlserver://host/instance?trusted_connection=yes`. Include additional parameters like `TrustServerCertificate=true` for self-signed certificates or `encrypt=disable` to disable encryption.").
+		Example("sqlserver://username:password@host/instance?param1=value&param2=value"),
+	).
+	Field(service.NewBoolField(fieldStreamSnapshot).
+		Description("Whether to stream a snapshot of all existing data before streaming CDC changes. When set to `true`, the connector first queries all existing table data, then switches to streaming incremental changes from the change tables. When set to `false`, no snapshot is taken and, on first run, streaming begins from the start of each table's existing change table: every change retained by SQL Server's CDC capture and cleanup jobs (three days by default) is replayed, not only changes from the current LSN onward. To begin from the present on a table that already holds change history, disable and re-enable CDC on the table immediately before starting the pipeline so that its change table starts empty. The snapshot reads each table in a transaction at `SNAPSHOT` isolation, so the database must allow it: run `ALTER DATABASE <database> SET ALLOW_SNAPSHOT_ISOLATION ON` before enabling this field.").
+		ShortDescription("Snapshot existing data first. Otherwise streaming replays everything retained in the change tables.").
+		Example(true).
+		Default(false),
+	).
+	Field(cdcreplication.MaxParallelSnapshotTablesField("Each table is read by its own reader.")).
+	Field(service.NewIntField(fieldSnapshotMaxBatchSize).
+		Description("The maximum number of rows to stream in a single batch during the initial snapshot phase. Larger batch sizes can improve throughput for initial data loads but may increase memory usage. This setting only applies when `stream_snapshot` is enabled.").
+		Default(1000),
+	).
+	Field(service.NewStringListField(fieldTablesInclude).
+		Description("Regular expressions for tables to include in CDC streaming. Specify table names using the format `schema.table` (such as `dbo.orders`, `sales.customers`). Each pattern is treated as a regular expression, allowing wildcards and pattern matching. All specified tables must have CDC enabled in SQL Server.").
+		Example("dbo.products"),
+	).
+	Field(service.NewStringListField(fieldTablesExclude).
+		Description("Regular expressions for tables to exclude from CDC streaming. Use this to filter out specific tables from the include patterns. Table names should follow the `schema.table` format. Exclude patterns are applied after include patterns, allowing you to include broad patterns while excluding specific tables.").
+		Example("dbo.privatetable").
+		Optional(),
+	).
+	Field(service.NewStringField(fieldCheckpointCache).
+		Description("A xref:components:caches/about.adoc[cache resource] to store the current Log Sequence Number (LSN) position. The cache stores the highest LSN that has been successfully delivered downstream, which allows Redpanda Connect to resume from the last processed position after a restart, rather than consume the entire state of the change table. If not set, the default Microsoft SQL Server based cache is used. See `" + fieldCheckpointCacheTableName + "` for more information.").
+		Optional(),
+	).
+	Field(service.NewStringField(fieldCheckpointCacheTableName).
+		Description("The multipart identifier for the checkpoint cache table name. If no `" + fieldCheckpointCache + "` field is specified, this input will automatically create a table and stored procedure under the `rpcn` schema to act as a checkpoint cache. This table stores the latest processed Log Sequence Number (LSN) that has been successfully delivered, allowing Redpanda Connect to resume from that point upon restart rather than reconsume the entire change table.").Version("4.67.0").
+		Default(defaultCheckpointCache).
+		Example("dbo.checkpoint_cache").
+		Optional(),
+	).
+	Field(service.NewStringField(fieldCheckpointCacheConnectionString).
+		Description("An optional connection string for a remote Microsoft SQL Server to use for the checkpoint cache. When set, this creates the checkpoint cache table on the remote server instead of the source database. If `" + fieldCheckpointCache + "` is also set, that takes precedence.").Version("4.87.0").
+		Example("sqlserver://username:password@remotehost/instance?param1=value&param2=value").
+		Optional(),
+	).
+	Field(service.NewStringField(fieldCheckpointCacheKey).
+		Description("The key to use to store the snapshot position in `" + fieldCheckpointCache + "`. An alternative key can be provided if multiple CDC inputs share the same cache.").Version("4.67.0").
+		Default("microsoft_sql_server_cdc").
+		Optional(),
+	).
+	Field(service.NewIntField(fieldCheckpointLimit).
+		Description("The maximum number of messages that can be processed concurrently before applying back pressure. Higher values enable more parallel processing and batching at the output level, but increase memory usage. To preserve at-least-once delivery guarantees, a given Log Sequence Number (LSN) is only acknowledged after all messages under that offset are delivered.").
+		ShortDescription("The maximum number of messages that can be processed at a given time.").
+		Default(1024),
+	).
+	Field(service.NewDurationField(fieldStreamBackoffInterval).
+		Description("The interval to wait before checking for new changes after a pass over the change tables completes. Each pass drains changes up to the maximum LSN observed as the pass began, then waits for this interval while SQL Server's capture job continues to publish changes. For low-traffic tables, increasing this value reduces query load on the server. For high-traffic tables, a longer interval directly reduces throughput, because the input sits idle for the full interval between passes. Consider lowering it towards `500ms`, which matches the default poll interval of comparable CDC systems. Use Go duration format such as `500ms`, `5s`, or `1m`.").
+		ShortDescription("Interval between passes over the change tables. On busy tables lower values increase throughput.").
+		Default("5s").
+		Example("500ms").Example("5s").Example("1m"),
+	).
+	Field(service.NewAutoRetryNacksToggleField()).
+	Field(service.NewBatchPolicyField(fieldBatching))
+
+type asyncMessage struct {
+	msg   service.MessageBatch
+	ackFn service.AckFunc
+}
+
+type config struct {
+	connectionString        string
+	streamSnapshot          bool
+	streamBackoffInterval   time.Duration
+	snapshotMaxBatchSize    int
+	snapshotMaxWorkers      int
+	tablesFilter            *confx.RegexpFilter
+	lsnCache                string
+	lsnCacheKey             string
+	cpCacheTableName        string
+	cpCacheConnectionString string
+}
+
+type sqlServerCDCInput struct {
+	cfg *config
+	db  *sql.DB
+
+	res *service.Resources
+	// publisher is rebuilt by Connect when poisoned, and read by ReadBatch
+	// and Close on other goroutines: atomic so those reads can never observe
+	// a torn or stale pointer and Close always stops the CURRENT publisher.
+	publisher atomic.Pointer[batchPublisher]
+	metrics   *service.Metrics
+
+	connMu  sync.Mutex
+	stopSig *shutdown.Signaller
+	log     *service.Logger
+	cpCache service.Cache
+
+	// batching and checkpointLimit are retained so Connect can rebuild a
+	// poisoned publisher (see batchPublisher.poisoned).
+	batching        service.BatchPolicy
+	checkpointLimit int
+
+	// lastPersistedMu serializes cacheLSN writes across publisher generations
+	// and lastPersistedLSN keeps them monotonic: after a rebuild a previous
+	// session's late acks may still arrive, and a stale write must never
+	// regress the durable resume position.
+	lastPersistedMu  sync.Mutex
+	lastPersistedLSN replication.LSN
+}
+
+func newMSSQLServerCDCInput(conf *service.ParsedConfig, resources *service.Resources) (s service.BatchInput, err error) {
+	var (
+		connectionString             string
+		streamSnapshot               bool
+		snapshotMaxWorkers           int
+		streamBackoffInterval        time.Duration
+		snapshotMaxBatchSize         int
+		lsnCache, lsnCacheKey        string
+		tableIncludes, tableExcludes []*regexp.Regexp
+		batcher                      *service.Batcher
+		cp                           *checkpoint.Capped[replication.LSN]
+		cpCache                      service.Cache
+		cpCacheTableName             string
+	)
+
+	if err := license.CheckRunningEnterprise(resources); err != nil {
+		return nil, err
+	}
+	if connectionString, err = conf.FieldString(fieldConnectionString); err != nil {
+		return nil, err
+	}
+	if streamSnapshot, err = conf.FieldBool(fieldStreamSnapshot); err != nil {
+		return nil, err
+	}
+	if snapshotMaxWorkers, err = conf.FieldInt(fieldMaxParallelSnapshotTables); err != nil {
+		return nil, err
+	}
+	if snapshotMaxBatchSize, err = conf.FieldInt(fieldSnapshotMaxBatchSize); err != nil {
+		return nil, err
+	}
+	if streamBackoffInterval, err = conf.FieldDuration(fieldStreamBackoffInterval); err != nil {
+		return nil, err
+	}
+	// tables
+	if includes, err := conf.FieldStringList(fieldTablesInclude); err != nil {
+		return nil, err
+	} else if tableIncludes, err = confx.ParseRegexpPatterns(includes); err != nil {
+		return nil, err
+	}
+	if excludes, err := conf.FieldStringList(fieldTablesExclude); err != nil {
+		return nil, err
+	} else if tableExcludes, err = confx.ParseRegexpPatterns(excludes); err != nil {
+		return nil, err
+	}
+	// cache
+	// if no cache component is specified then we fallback to default sql based version
+	if conf.Contains(fieldCheckpointCache) {
+		if lsnCache, err = conf.FieldString(fieldCheckpointCache); err != nil {
+			return nil, err
+		}
+		if conf.Resources().HasCache(lsnCache) {
+			if lsnCacheKey, err = conf.FieldString(fieldCheckpointCacheKey); err != nil {
+				return nil, err
+			}
+		}
+	}
+
+	if cpCacheTableName, err = conf.FieldString(fieldCheckpointCacheTableName); err != nil {
+		return nil, err
+	}
+
+	var cpCacheConnectionString string
+	if conf.Contains(fieldCheckpointCacheConnectionString) {
+		if cpCacheConnectionString, err = conf.FieldString(fieldCheckpointCacheConnectionString); err != nil {
+			return nil, err
+		}
+	}
+
+	// checkpointing
+	var checkpointLimit int
+	if checkpointLimit, err = conf.FieldInt(fieldCheckpointLimit); err != nil {
+		return nil, err
+	}
+	cp = checkpoint.NewCapped[replication.LSN](int64(checkpointLimit))
+
+	// batching
+	var policy service.BatchPolicy
+	if policy, err = conf.FieldBatchPolicy(fieldBatching); err != nil {
+		return nil, err
+	} else if policy.IsNoop() {
+		policy.Count = 1
+	}
+	if batcher, err = policy.NewBatcher(resources); err != nil {
+		return nil, err
+	}
+
+	logger := resources.Logger()
+
+	i := sqlServerCDCInput{
+		cfg: &config{
+			connectionString:        connectionString,
+			streamSnapshot:          streamSnapshot,
+			streamBackoffInterval:   streamBackoffInterval,
+			snapshotMaxWorkers:      snapshotMaxWorkers,
+			snapshotMaxBatchSize:    snapshotMaxBatchSize,
+			lsnCache:                lsnCache,
+			lsnCacheKey:             lsnCacheKey,
+			cpCacheTableName:        cpCacheTableName,
+			cpCacheConnectionString: cpCacheConnectionString,
+			tablesFilter: &confx.RegexpFilter{
+				Include: tableIncludes,
+				Exclude: tableExcludes,
+			},
+		},
+		res:             resources,
+		log:             logger,
+		metrics:         resources.Metrics(),
+		stopSig:         shutdown.NewSignaller(),
+		cpCache:         cpCache,
+		batching:        policy,
+		checkpointLimit: checkpointLimit,
+	}
+
+	pub := newBatchPublisher(batcher, cp, logger)
+	pub.cacheLSN = i.cacheLSN
+	i.publisher.Store(pub)
+
+	// Has stopped is how we notify that we're not connected. This will get reset at connection time.
+	i.stopSig.TriggerHasStopped()
+
+	batchInput, err := service.AutoRetryNacksBatchedToggled(conf, &i)
+	if err != nil {
+		return nil, err
+	}
+
+	return conf.WrapBatchInputExtractTracingSpanMapping("microsoft_sql_server_cdc", batchInput)
+}
+
+// rebuildPublisherIfPoisoned returns the current publisher, replacing it
+// first when a failed send or a sealed flush queue poisoned it: the old
+// generation is closed (its flush loop stops; in-flight ack functions keep
+// resolving into the abandoned tracker, where cacheLSN's monotonic guard
+// makes any stale persist a no-op) and a fresh batcher and tracker take its
+// place, so the new session resumes from the last durable LSN.
+func (i *sqlServerCDCInput) rebuildPublisherIfPoisoned() (*batchPublisher, error) {
+	publisher := i.publisher.Load()
+	if !publisher.poisoned() {
+		return publisher, nil
+	}
+	if err := publisher.queue.Err(); err != nil {
+		i.log.Warnf("Rebuilding publisher: rows were dropped, so the flush queue is sealed: %v", err)
+	} else {
+		i.log.Warn("Rebuilding publisher: a batch could not be handed to the pipeline, so the previous checkpoint tracker is pinned")
+	}
+	publisher.close()
+	batcher, err := i.batching.NewBatcher(i.res)
+	if err != nil {
+		return nil, fmt.Errorf("rebuilding batcher: %w", err)
+	}
+	publisher = newBatchPublisher(batcher, checkpoint.NewCapped[replication.LSN](int64(i.checkpointLimit)), i.log)
+	publisher.cacheLSN = i.cacheLSN
+	i.publisher.Store(publisher)
+	return publisher, nil
+}
+
+func (i *sqlServerCDCInput) Connect(ctx context.Context) error {
+	i.connMu.Lock()
+	defer i.connMu.Unlock()
+
+	// If the background goroutine from a previous Connect is still running,
+	// skip reconnection. HasStoppedChan is closed initially (constructor) and
+	// when the goroutine exits, so a blocking default means "still active".
+	select {
+	case <-i.stopSig.HasStoppedChan():
+	default:
+		return nil
+	}
+
+	// A failed batch send leaves an unresolvable slot in the ordered tracker
+	// (see sendTracked), and a sealed flush queue refuses every later batch
+	// (see sealQueue), so a poisoned publisher can never checkpoint again.
+	// Rebuild it with a fresh tracker: the new session resumes from the last
+	// durable LSN, which is necessarily before the orphaned rows, and the old
+	// session's late acks resolve into the abandoned tracker (cacheLSN's
+	// monotonic guard turns any stale write into a no-op).
+	publisher, err := i.rebuildPublisherIfPoisoned()
+	if err != nil {
+		return err
+	}
+
+	var (
+		userTables []replication.UserDefinedTable
+		cachedLSN  replication.LSN
+	)
+	if i.db, err = sql.Open("mssql", i.cfg.connectionString); err != nil {
+		return fmt.Errorf("connecting to microsoft sql server: %s", err)
+	}
+
+	// no cache specified so use default, custom sql cache
+	if i.cfg.lsnCache == "" {
+		cacheConnStr := i.cfg.connectionString
+		if i.cfg.cpCacheConnectionString != "" {
+			cacheConnStr = i.cfg.cpCacheConnectionString
+		}
+		cache, err := newCheckpointCache(ctx, cacheConnStr, i.cfg.cpCacheTableName, i.log)
+		if err != nil {
+			return fmt.Errorf("initialising sql server based checkpoint cache: %s", err)
+		}
+		i.cpCache = cache
+	}
+
+	if userTables, err = replication.VerifyUserDefinedTables(ctx, i.db, i.cfg.tablesFilter, i.log); err != nil {
+		return fmt.Errorf("verifying user defined tables: %w", err)
+	}
+	if cachedLSN, err = i.getCachedLSN(ctx); err != nil {
+		return fmt.Errorf("unable to get cached LSN: %s", err)
+	}
+
+	// setup snapshotting and streaming
+	var (
+		snapshotter *replication.Snapshot
+		streaming   *replication.ChangeTableStream
+	)
+	// no cached LSN means we're not recovering from a restart
+	if i.cfg.streamSnapshot && len(cachedLSN) == 0 {
+		if snapshotter, err = replication.NewSnapshot(i.cfg.connectionString, userTables, publisher, i.log, i.metrics); err != nil {
+			return fmt.Errorf("creating database snapshotter: %w", err)
+		}
+	} else {
+		i.log.Infof("Snapshotting disabled, skipping...")
+	}
+
+	streaming = replication.NewChangeTableStream(userTables, publisher, i.cfg.streamBackoffInterval, i.log)
+
+	// Reset our stop signal
+	i.stopSig = shutdown.NewSignaller()
+
+	go func() {
+		var (
+			err    error
+			maxLSN = cachedLSN
+		)
+		softCtx, _ := i.stopSig.SoftStopCtx(context.Background())
+
+		// snapshot if no LSN exists then store checkpoint once complete
+		if snapshotter != nil {
+			if maxLSN, err = i.processSnapshot(softCtx, snapshotter); err != nil {
+				if i.stopSig.IsHardStopSignalled() {
+					i.log.Errorf("Shutting down snapshotting process: %s", err)
+				} else {
+					i.log.Infof("Gracefully shutting down snapshotting process: %s", err)
+				}
+				i.stopSig.TriggerHasStopped()
+				return
+			}
+
+			// Flush the partial snapshot batch still held by the batcher, then
+			// block until every snapshot batch is acknowledged downstream.
+			// Persisting the LSN any earlier would let a crash in this window
+			// skip un-acked snapshot rows on restart. Blocks until acks drain
+			// or soft-stop (no timeout, by design; see postgres_cdc's
+			// equivalent barrier).
+			if err = publisher.flushCurrent(softCtx); err != nil {
+				// A graceful stop lands here whenever shutdown hits the
+				// handoff window (nothing drains msgChan any more, so the
+				// blocked send exits via softCtx): normal operation, Info.
+				// Genuine flush failures keep the error level.
+				if errors.Is(err, context.Canceled) && !i.stopSig.IsHardStopSignalled() {
+					i.log.Infof("Interrupted while flushing remaining snapshot batches. Snapshot will re-run on restart (may cause duplicate data): %s", err)
+				} else {
+					i.log.Errorf("Failed to flush remaining snapshot batches. Snapshot will re-run on restart (may cause duplicate data): %s", err)
+				}
+				i.stopSig.TriggerHasStopped()
+				return
+			}
+			if err = publisher.waitSnapshotAcks(softCtx); err != nil {
+				i.log.Infof("Interrupted while waiting for snapshot acknowledgements. Snapshot will re-run on restart (may cause duplicate data): %s", err)
+				i.stopSig.TriggerHasStopped()
+				return
+			}
+
+			if err = i.cacheLSN(softCtx, maxLSN); err != nil {
+				if i.stopSig.IsHardStopSignalled() {
+					i.log.Errorf("Shutting down snapshotting process: %s", err)
+				} else {
+					i.log.Infof("Gracefully shutting down snapshotting process: %s", err)
+				}
+				i.stopSig.TriggerHasStopped()
+				return
+			}
+			i.log.Debugf("Cached LSN following snapshot: '%s'", maxLSN)
+		}
+
+		// streaming
+		wg, ctx := errgroup.WithContext(softCtx)
+		wg.Go(func() error {
+			// ReadChangeTables only returns once it hits an error.
+			return fmt.Errorf("streaming from change tables: %w", streaming.ReadChangeTables(ctx, i.db, maxLSN))
+		})
+		if err := wg.Wait(); err != nil && !errors.Is(err, context.Canceled) {
+			i.log.Errorf("Error during Microsoft SQL Server CDC Component: %s", err)
+		} else {
+			i.log.Info("Successfully shutdown Microsoft SQL Server CDC Component")
+		}
+		i.stopSig.TriggerHasStopped()
+	}()
+
+	return nil
+}
+
+func (i *sqlServerCDCInput) getCachedLSN(ctx context.Context) (replication.LSN, error) {
+	var (
+		cacheVal []byte
+		cErr     error
+	)
+
+	if i.cpCache != nil {
+		// use default custom sql server based cache
+		cacheVal, cErr = i.cpCache.Get(ctx, i.cfg.lsnCacheKey)
+	} else {
+		if err := i.res.AccessCache(ctx, i.cfg.lsnCache, func(c service.Cache) {
+			cacheVal, cErr = c.Get(ctx, i.cfg.lsnCacheKey)
+		}); err != nil {
+			return nil, fmt.Errorf("unable to access cache for reading: %w", err)
+		}
+	}
+
+	if errors.Is(cErr, service.ErrKeyNotFound) {
+		return nil, nil
+	} else if cErr != nil {
+		return nil, fmt.Errorf("unable read checkpoint from cache: %w", cErr)
+	} else if len(cacheVal) == 0 {
+		return nil, nil
+	}
+	return replication.LSN(cacheVal), nil
+}
+
+func (i *sqlServerCDCInput) cacheLSN(ctx context.Context, lsn replication.LSN) error {
+	if len(lsn) == 0 {
+		return errors.New("LSN for caching is empty")
+	}
+
+	// Serialized and monotonic across publisher generations: a previous
+	// session's late acks must never land a stale LSN over a newer durable
+	// position. LSNs are fixed-width and byte-ordered, so skipping
+	// non-advancing writes is always safe.
+	i.lastPersistedMu.Lock()
+	defer i.lastPersistedMu.Unlock()
+	if len(i.lastPersistedLSN) != 0 && bytes.Compare(lsn, i.lastPersistedLSN) <= 0 {
+		return nil
+	}
+
+	var cErr error
+	if i.cpCache != nil {
+		cErr = i.cpCache.Set(ctx, i.cfg.lsnCacheKey, lsn, nil)
+	} else {
+		if err := i.res.AccessCache(ctx, i.cfg.lsnCache, func(c service.Cache) {
+			cErr = c.Set(ctx, i.cfg.lsnCacheKey, lsn, nil)
+		}); err != nil {
+			return fmt.Errorf("unable to access cache for writing: %w", err)
+		}
+	}
+
+	if cErr != nil {
+		return fmt.Errorf("unable persist checkpoint to cache: %w", cErr)
+	}
+	i.lastPersistedLSN = lsn
+	return nil
+}
+
+func (i *sqlServerCDCInput) ReadBatch(ctx context.Context) (service.MessageBatch, service.AckFunc, error) {
+	pub := i.publisher.Load()
+	// Observed so a dead flush loop cannot silently stall the pipeline: with
+	// period-only batching that loop is the only flusher, and its error paths
+	// poison the publisher but cannot force a reconnect themselves.
+	pubStopped := pub.shutSig.HasStoppedChan()
+	for {
+		select {
+		case m := <-pub.msgs():
+			return m.msg, m.ackFn, nil
+		case <-pubStopped:
+			if pub.poisoned() {
+				// Fatal flush-loop exit: tear the session down BEFORE handing
+				// control to Connect - the session goroutine may still be
+				// alive (Connect's still-active guard would otherwise turn
+				// this into a busy reconnect loop), and every session path
+				// escapes on the soft stop. The constructor leaves HasStopped
+				// triggered, so the wait is bounded; ctx stays the escape
+				// hatch regardless.
+				i.stopSig.TriggerSoftStop()
+				select {
+				case <-i.stopSig.HasStoppedChan():
+				case <-ctx.Done():
+					return nil, nil, ctx.Err()
+				}
+				return nil, nil, service.ErrNotConnected
+			}
+			// Deliberate stop (input Close): keep draining any batch still
+			// undelivered on msgs().
+			pubStopped = nil
+		case <-i.stopSig.HasStoppedChan():
+			return nil, nil, service.ErrNotConnected
+		case <-ctx.Done():
+			return nil, nil, ctx.Err()
+		}
+	}
+}
+
+func (i *sqlServerCDCInput) processSnapshot(ctx context.Context, snapshot *replication.Snapshot) (replication.LSN, error) {
+	var (
+		lsn replication.LSN
+		err error
+	)
+	if lsn, err = snapshot.Prepare(ctx); err != nil {
+		_ = snapshot.Close()
+		return nil, fmt.Errorf("preparing snapshot: %w", err)
+	}
+	if err = snapshot.Read(ctx, i.cfg.snapshotMaxWorkers, i.cfg.snapshotMaxBatchSize); err != nil {
+		_ = snapshot.Close()
+		return nil, fmt.Errorf("reading snapshot: %w", err)
+	}
+	if err = snapshot.Close(); err != nil {
+		return nil, fmt.Errorf("closing snapshot connections: %w", err)
+	}
+	i.log.Infof("Completed running snapshot process")
+
+	return lsn, nil
+}
+
+func (i *sqlServerCDCInput) Close(ctx context.Context) error {
+	if i.stopSig == nil {
+		return nil // Never connected
+	}
+	// Mark the publisher as stopping BEFORE any cancellation propagates: the
+	// session's contexts unwind off stopSig, and sendTracked needs the flag
+	// already visible to log the graceful unwind at debug rather than warn.
+	if pub := i.publisher.Load(); pub != nil {
+		pub.stopping.Store(true)
+	}
+	i.stopSig.TriggerSoftStop()
+	// Shut the publisher down alongside the session: its timed-flush loop
+	// runs under the publisher's OWN signaller, and a flush parked in
+	// sendTracked (nothing drains msgChan once ReadBatch stops) would
+	// otherwise hold its flush ticket forever - wedging every other flusher
+	// waiting in Ticket.Wait and leaking the session goroutines past the
+	// timeout. Cancelling the loop's context releases its ticket, and the
+	// chain then drains: each later ticket holder's Track/send escapes via
+	// its stopSig-derived context.
+	if pub := i.publisher.Load(); pub != nil {
+		pub.shutSig.TriggerSoftStop()
+	}
+	select {
+	case <-ctx.Done():
+	case <-time.After(shutdownTimeout):
+	case <-i.stopSig.HasStoppedChan():
+	}
+
+	i.stopSig.TriggerHardStop()
+	select {
+	case <-ctx.Done():
+	case <-time.After(shutdownTimeout):
+		i.log.Error("failed to shutdown 'microsoft_sql_server_cdc' component within the timeout")
+	case <-i.stopSig.HasStoppedChan():
+	}
+	if i.cpCache != nil {
+		return i.cpCache.Close(ctx)
+	}
+	if i.db != nil {
+		return i.db.Close()
+	}
+	return nil
+}

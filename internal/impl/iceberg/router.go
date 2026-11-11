@@ -1,0 +1,1017 @@
+// Copyright 2026 Redpanda Data, Inc.
+//
+// Licensed as a Redpanda Enterprise file under the Redpanda Community
+// License (the "License"); you may not use this file except in compliance with
+// the License. You may obtain a copy of the License at
+//
+// https://github.com/redpanda-data/redpanda/blob/master/licenses/rcl.md
+
+package iceberg
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"maps"
+	"slices"
+	"strings"
+	"sync"
+
+	"github.com/apache/iceberg-go"
+	"github.com/apache/iceberg-go/catalog"
+	"github.com/apache/iceberg-go/table"
+	"github.com/parquet-go/parquet-go"
+
+	"github.com/redpanda-data/benthos/v4/public/bloblang"
+	"github.com/redpanda-data/benthos/v4/public/service"
+	"github.com/redpanda-data/connect/v4/internal/impl/iceberg/catalogx"
+	"github.com/redpanda-data/connect/v4/internal/impl/iceberg/icebergx"
+	"github.com/redpanda-data/connect/v4/internal/impl/iceberg/shredder"
+)
+
+// tableKey uniquely identifies an Iceberg table.
+type tableKey struct {
+	namespace string // dot-separated namespace
+	table     string
+}
+
+// SchemaEvolutionConfig holds configuration for automatic table creation and schema evolution.
+type SchemaEvolutionConfig struct {
+	// Enabled controls whether auto-creation and schema evolution are active.
+	Enabled bool
+	// PartitionSpec is an interpolated string that produces a partition spec expression
+	// when evaluated against the first message (e.g., "(year(ts), bucket(16, id))").
+	PartitionSpec *service.InterpolatedString
+	// TableLocation is a prefix used to derive table locations when the catalog
+	// does not automatically assign them (e.g., AWS Glue). When set, new table
+	// locations are derived as {prefix}{namespace}/{table}.
+	TableLocation string
+	// SchemaMetadata is the name of a message metadata field containing a schema.Common
+	// definition for determining column types during schema evolution.
+	SchemaMetadata string
+	// NewColumnTypeMapping is an optional Bloblang mapping that can override inferred
+	// or schema-metadata-derived column types during schema evolution.
+	NewColumnTypeMapping *bloblang.Executor
+	// RequireSchemaMetadata enables strict mode: when true, writing a numeric
+	// value into a time-typed column without registered schema metadata is a
+	// hard error rather than a silent fallback to bloblang's seconds-default.
+	// Only meaningful when SchemaMetadata is also set.
+	RequireSchemaMetadata bool
+}
+
+const maxSchemaEvolutionRetries = 10
+
+// tableEntry holds a writer and its associated lock for a single table.
+// The RWMutex allows concurrent writes (RLock) while serializing
+// schema evolution operations (Lock).
+type tableEntry struct {
+	mu     sync.RWMutex
+	writer *writer
+
+	// tsEncoding caches the table's resolved timestamp encoding (see
+	// resolveTimestampEncoding) so the footer-probe/stamp bootstrap runs at
+	// most once per table per process — writer re-creation (schema evolution,
+	// error recovery) reuses it. Guarded by mu; valid when tsEncodingResolved.
+	tsEncoding         icebergx.TimestampEncoding
+	tsEncodingResolved bool
+
+	// tsEncodingProbeErr negative-caches a probe-bound failure
+	// (errTimestampProbeBoundExceeded) observed on tsEncodingProbeSnapshot:
+	// the scan is deterministic for a given snapshot, so re-running it on
+	// every retried write would re-pay up to maxProbedFiles object-store
+	// footer reads under this entry's lock for the identical answer. The
+	// cache self-heals: a new snapshot (files landed) re-probes, and an
+	// operator setting the pinning property takes the property-present path,
+	// which never consults it. Guarded by mu. Only the deterministic bound
+	// error is ever cached — transient probe failures must retry.
+	tsEncodingProbeErr      error
+	tsEncodingProbeSnapshot int64
+
+	// retryPropWarned dedupes the commit.retry.num-retries hazard warning to
+	// once per table per process (writer recreation would otherwise repeat it
+	// on every failure). Guarded by mu.
+	retryPropWarned bool
+
+	// prohibitedProps persists the catalog-prohibited property keys learned
+	// by this table's committers (mirroring the tsEncoding cache pattern):
+	// writeWithRetry closes the writer on every failure, so without it each
+	// recreated committer would re-learn the keys at the cost of one rejected
+	// commit per generation. Created lazily in createWriter under mu; the set
+	// carries its own lock, so committers share it race-safely.
+	prohibitedProps *prohibitedKeySet
+}
+
+// cachedProbeErr returns the negative-cached probe-bound error when it was
+// observed on tbl's CURRENT snapshot; a different (or absent) snapshot means
+// files have landed since, so the cache is cleared and the probe re-runs.
+// Caller must hold e.mu.
+func (e *tableEntry) cachedProbeErr(tbl *table.Table) error {
+	if e.tsEncodingProbeErr == nil {
+		return nil
+	}
+	if snap := tbl.CurrentSnapshot(); snap != nil && snap.SnapshotID == e.tsEncodingProbeSnapshot {
+		return e.tsEncodingProbeErr
+	}
+	e.tsEncodingProbeErr = nil
+	return nil
+}
+
+// noteProbeErr caches err against tbl's current snapshot when — and only
+// when — it is the deterministic probe-bound failure; transient probe
+// failures are never cached and must retry. Reports whether it cached, so the
+// caller can emit the one-time warning. Caller must hold e.mu.
+func (e *tableEntry) noteProbeErr(tbl *table.Table, err error) bool {
+	if !errors.Is(err, errTimestampProbeBoundExceeded) {
+		return false
+	}
+	snap := tbl.CurrentSnapshot()
+	if snap == nil {
+		return false
+	}
+	e.tsEncodingProbeErr = err
+	e.tsEncodingProbeSnapshot = snap.SnapshotID
+	return true
+}
+
+// Router routes message batches to per-table writers.
+type Router struct {
+	catalogCfg    catalogx.Config
+	namespaceStr  *service.InterpolatedString
+	tableStr      *service.InterpolatedString
+	caseSensitive bool
+	schemaEvoCfg  SchemaEvolutionConfig
+	commitCfg     CommitConfig
+	rowOpCfg      RowOpConfig
+	writerOpts    []parquet.WriterOption
+	resolver      *typeResolver
+
+	entries sync.Map // tableKey -> *tableEntry
+
+	// warnedCompression de-duplicates compression warnings, keyed by table and
+	// warning text together: rebuilding a writer does not re-log a warning for
+	// that table, but a second table hitting the same problem is still reported.
+	// See warnCompressionOnce.
+	warnedCompression sync.Map
+
+	// parquetCompression is the configured `parquet.compression` value, or ""
+	// when unset. Set after construction by the output, like metrics below, so
+	// NewRouter's signature stays put. Empty means each table falls back to its
+	// own write.parquet.compression-codec property — see
+	// resolveParquetCompression.
+	parquetCompression string
+
+	// metrics is optional (nil in some tests); set after construction by the
+	// output. Writers and committers inherit it.
+	metrics *opMetrics
+
+	logger *service.Logger
+}
+
+// NewRouter creates a new router. caseSensitive controls how message keys are
+// matched against schema field names and how column references are resolved
+// during schema evolution and partition spec parsing. When false, names are
+// compared case-insensitively, matching iceberg's recommended convention.
+func NewRouter(
+	catalogCfg catalogx.Config,
+	namespaceStr *service.InterpolatedString,
+	tableStr *service.InterpolatedString,
+	caseSensitive bool,
+	schemaEvoCfg SchemaEvolutionConfig,
+	commitCfg CommitConfig,
+	rowOpCfg RowOpConfig,
+	writerOpts []parquet.WriterOption,
+	logger *service.Logger,
+) *Router {
+	return &Router{
+		catalogCfg:    catalogCfg,
+		namespaceStr:  namespaceStr,
+		tableStr:      tableStr,
+		caseSensitive: caseSensitive,
+		schemaEvoCfg:  schemaEvoCfg,
+		commitCfg:     commitCfg,
+		rowOpCfg:      rowOpCfg,
+		writerOpts:    writerOpts,
+		resolver:      newTypeResolver(schemaEvoCfg.SchemaMetadata, schemaEvoCfg.NewColumnTypeMapping, caseSensitive, logger),
+		logger:        logger,
+	}
+}
+
+// getOrCreateEntry returns the entry for a table, creating one if needed.
+func (r *Router) getOrCreateEntry(key tableKey) *tableEntry {
+	if v, ok := r.entries.Load(key); ok {
+		return v.(*tableEntry)
+	}
+	entry := &tableEntry{}
+	actual, _ := r.entries.LoadOrStore(key, entry)
+	return actual.(*tableEntry)
+}
+
+// Route routes a batch of messages to the appropriate writers.
+func (r *Router) Route(ctx context.Context, batch service.MessageBatch) error {
+	// fast path if static namespace + table is used.
+	if ns, ok := r.namespaceStr.Static(); ok {
+		if tbl, ok := r.tableStr.Static(); ok {
+			key := tableKey{namespace: ns, table: tbl}
+			return r.writeWithRetry(ctx, key, batch)
+		}
+	}
+
+	// Group messages by table key
+	groups := make(map[tableKey]service.MessageBatch)
+
+	nsExec := batch.InterpolationExecutor(r.namespaceStr)
+	tableExec := batch.InterpolationExecutor(r.tableStr)
+	for i, msg := range batch {
+		ns, err := nsExec.TryString(i)
+		if err != nil {
+			return fmt.Errorf("interpolating namespace: %w", err)
+		}
+
+		tbl, err := tableExec.TryString(i)
+		if err != nil {
+			return fmt.Errorf("interpolating table: %w", err)
+		}
+
+		key := tableKey{namespace: ns, table: tbl}
+		groups[key] = append(groups[key], msg)
+	}
+
+	// Write each group to its writer with retry loop
+	for key, groupBatch := range groups {
+		if err := r.writeWithRetry(ctx, key, groupBatch); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+// writeWithRetry writes a batch to a table with retry loop for schema evolution.
+// On any failure the writer is always closed so the next attempt reloads the table.
+// Every error gets at least one retry; schema evolution errors get up to maxSchemaEvolutionRetries.
+func (r *Router) writeWithRetry(ctx context.Context, key tableKey, batch service.MessageBatch) error {
+	entry := r.getOrCreateEntry(key)
+
+	for i := range maxSchemaEvolutionRetries {
+		err := r.doWrite(ctx, key, entry, batch)
+		if err == nil {
+			return nil
+		}
+
+		// Always close the writer on failure so the next attempt gets a fresh table.
+		entry.mu.Lock()
+		r.closeWriter(entry)
+		entry.mu.Unlock()
+
+		// When schema evolution is enabled, perform recovery actions for known errors.
+		if r.schemaEvoCfg.Enabled {
+			if errors.Is(err, catalog.ErrNoSuchNamespace) {
+				if nsErr := r.createNamespace(ctx, key, entry); nsErr != nil {
+					return fmt.Errorf("creating namespace %s: %w", key.namespace, nsErr)
+				}
+				continue
+			}
+
+			if errors.Is(err, catalog.ErrNoSuchTable) {
+				createErr := r.createTable(ctx, key, batch, entry)
+				if createErr != nil {
+					if errors.Is(createErr, catalog.ErrNoSuchNamespace) {
+						if nsErr := r.createNamespace(ctx, key, entry); nsErr != nil {
+							return fmt.Errorf("creating namespace %s: %w", key.namespace, nsErr)
+						}
+					} else {
+						return fmt.Errorf("creating table %s.%s: %w", key.namespace, key.table, createErr)
+					}
+				}
+				continue
+			}
+
+			if schemaErr, ok := errors.AsType[*BatchSchemaEvolutionError](err); ok {
+				if evolveErr := r.evolveSchema(ctx, key, schemaErr, batch, entry); evolveErr != nil {
+					return fmt.Errorf("evolving schema for %s.%s: %w", key.namespace, key.table, evolveErr)
+				}
+				continue
+			}
+
+			if reqNullErr, ok := errors.AsType[*shredder.RequiredFieldNullError](err); ok {
+				if optErr := r.makeColumnOptional(ctx, key, reqNullErr, entry); optErr != nil {
+					return fmt.Errorf("making column optional for %s.%s: %w", key.namespace, key.table, optErr)
+				}
+				continue
+			}
+		}
+
+		// For all other errors (including stale schema, auth errors, or when schema
+		// evolution is disabled): the writer is already closed. Always retry at least
+		// once so the fresh writer can recover from transient failures.
+		if i == 0 {
+			r.logger.Debugf("Write failed for %s.%s, retrying with fresh writer: %v", key.namespace, key.table, err)
+			continue
+		}
+		return fmt.Errorf("writing to %s.%s: %w", key.namespace, key.table, err)
+	}
+
+	return fmt.Errorf("writing to %s.%s: exhausted %d retries", key.namespace, key.table, maxSchemaEvolutionRetries)
+}
+
+// doWrite performs a single write attempt, creating the writer if needed.
+func (r *Router) doWrite(ctx context.Context, key tableKey, entry *tableEntry, batch service.MessageBatch) error {
+	for {
+		// Fast path: writer exists, use RLock for concurrent writes
+		entry.mu.RLock()
+		w := entry.writer
+		if w != nil {
+			err := w.Write(ctx, batch)
+			entry.mu.RUnlock()
+			return err
+		}
+		entry.mu.RUnlock()
+
+		// Slow path: create writer under exclusive lock
+		entry.mu.Lock()
+		if entry.writer != nil {
+			// Another goroutine created it, retry with RLock
+			entry.mu.Unlock()
+			continue
+		}
+		w, err := r.createWriter(ctx, key, entry)
+		if err != nil {
+			entry.mu.Unlock()
+			return err
+		}
+		entry.writer = w
+		entry.mu.Unlock()
+		// Loop back to write with RLock
+	}
+}
+
+// createNamespace creates the namespace for a table.
+// tableLocationFor joins the configured table-location prefix with a table's
+// namespace path and name, tolerating a prefix with or without a trailing
+// slash. Bare concatenation previously required the trailing slash: a prefix
+// of `s3://bucket` produced `s3://bucketns/table`, which fails table creation
+// against a nonexistent bucket.
+func tableLocationFor(prefix string, nsParts []string, table string) string {
+	return strings.TrimSuffix(prefix, "/") + "/" + strings.Join(nsParts, "/") + "/" + table
+}
+
+func (r *Router) createNamespace(ctx context.Context, key tableKey, entry *tableEntry) error {
+	entry.mu.Lock()
+	defer entry.mu.Unlock()
+
+	nsParts := strings.Split(key.namespace, ".")
+	client, err := catalogx.NewCatalogClient(ctx, r.catalogCfg, nsParts)
+	if err != nil {
+		return fmt.Errorf("creating catalog client: %w", err)
+	}
+	defer client.Close()
+
+	// Check if namespace already exists (race protection)
+	exists, err := client.CheckNamespaceExists(ctx)
+	if err != nil {
+		return fmt.Errorf("checking namespace existence: %w", err)
+	}
+	if exists {
+		r.logger.Debugf("Namespace %s already exists (created by another process)", key.namespace)
+		return nil
+	}
+
+	// Create the namespace
+	if err := client.CreateNamespace(ctx, nil); err != nil {
+		return err
+	}
+
+	r.logger.Infof("Created namespace: %s", key.namespace)
+	return nil
+}
+
+// createTable creates a new table with schema inferred from the first message.
+func (r *Router) createTable(ctx context.Context, key tableKey, batch service.MessageBatch, entry *tableEntry) error {
+	entry.mu.Lock()
+	defer entry.mu.Unlock()
+
+	nsParts := strings.Split(key.namespace, ".")
+	client, err := catalogx.NewCatalogClient(ctx, r.catalogCfg, nsParts)
+	if err != nil {
+		return fmt.Errorf("creating catalog client: %w", err)
+	}
+	defer client.Close()
+
+	// Check if table already exists (race protection)
+	exists, err := client.CheckTableExists(ctx, key.table)
+	if err != nil {
+		return fmt.Errorf("checking table existence: %w", err)
+	}
+	if exists {
+		r.logger.Debugf("Table %s.%s already exists (created by another process)", key.namespace, key.table)
+		// Invalidate cached writer so it gets recreated with the new table
+		r.closeWriter(entry)
+		return nil
+	}
+
+	// Get first message to infer schema
+	if len(batch) == 0 {
+		return errors.New("cannot create table from empty batch")
+	}
+
+	firstMsg := batch[0]
+	structured, err := firstMsg.AsStructured()
+	if err != nil {
+		return fmt.Errorf("parsing first message: %w", err)
+	}
+
+	record, ok := structured.(map[string]any)
+	if !ok {
+		return fmt.Errorf("first message is not an object, got %T", structured)
+	}
+
+	// Build schema from record using the type resolver
+	schema, err := r.buildSchemaWithResolver(record, firstMsg, key)
+	if err != nil {
+		return fmt.Errorf("building schema from record: %w", err)
+	}
+
+	// Parse partition spec if configured
+	var partitionSpec *iceberg.PartitionSpec
+	if r.schemaEvoCfg.PartitionSpec != nil {
+		specStr, err := batch.TryInterpolatedString(0, r.schemaEvoCfg.PartitionSpec)
+		if err != nil {
+			return fmt.Errorf("interpolating partition spec: %w", err)
+		}
+		if specStr != "" {
+			spec, err := icebergx.ParsePartitionSpec(specStr, schema, r.caseSensitive)
+			if err != nil {
+				return fmt.Errorf("parsing partition spec %q: %w", specStr, err)
+			}
+			partitionSpec = &spec
+		}
+	}
+
+	// Build create table options
+	var createOpts []catalog.CreateTableOpt
+	if partitionSpec != nil {
+		createOpts = append(createOpts, catalog.WithPartitionSpec(partitionSpec))
+	}
+	if r.schemaEvoCfg.TableLocation != "" {
+		location := tableLocationFor(r.schemaEvoCfg.TableLocation, nsParts, key.table)
+		createOpts = append(createOpts, catalog.WithLocation(location))
+	}
+	// Pin the timestamp encoding at birth: tables created by this connector
+	// are spec-encoded from their first file, so the footer-probe bootstrap
+	// (resolveTimestampEncoding) never has to run for them.
+	createOpts = append(createOpts, catalog.WithProperties(iceberg.Properties{
+		icebergx.TimestampEncodingProperty: icebergx.TimestampEncodingSpec.String(),
+	}))
+
+	// Create the table
+	_, err = client.CreateTable(ctx, key.table, schema, createOpts...)
+	if err != nil {
+		// Check if table was created by another process
+		if errors.Is(err, catalog.ErrTableAlreadyExists) {
+			r.logger.Debugf("Table %s.%s already exists (created by another process)", key.namespace, key.table)
+			r.closeWriter(entry)
+			return nil
+		}
+		return err
+	}
+
+	// The property is stamped in the creation commit, so the resolution is
+	// already known — cache it to spare createWriter a parse.
+	entry.tsEncoding = icebergx.TimestampEncodingSpec
+	entry.tsEncodingResolved = true
+
+	r.logger.Infof("Created table: %s.%s with %d columns", key.namespace, key.table, len(schema.Fields()))
+	// Invalidate cached writer so it gets recreated with the new table
+	r.closeWriter(entry)
+	return nil
+}
+
+// buildSchemaWithResolver builds a schema using the type resolver for type resolution.
+func (r *Router) buildSchemaWithResolver(record map[string]any, msg *service.Message, key tableKey) (*iceberg.Schema, error) {
+	// In case-insensitive mode, two record keys differing only in case would
+	// collapse to a single iceberg column under spec rules — admitting both
+	// would either be silently rejected by the catalog or, worse, accepted
+	// and then conflict on every subsequent write. Refuse at create time.
+	if !r.caseSensitive {
+		if dupA, dupB, ok := findCaseOnlyDuplicate(record); ok {
+			return nil, fmt.Errorf("ambiguous columns at table creation: %q and %q differ only in case", dupA, dupB)
+		}
+	}
+
+	ti := newTypeInferrer(r.caseSensitive)
+	fields := make([]iceberg.NestedField, 0, len(record))
+
+	// Parse the schema metadata once; it's used for both column ordering and
+	// per-field type resolution.
+	common, err := r.resolver.parseSchemaMetadata(msg)
+	if err != nil {
+		return nil, fmt.Errorf("parsing schema metadata: %w", err)
+	}
+
+	// Build the final column ordering. Metadata-declared fields come first in
+	// the order they appear there, with case-folded matching against record
+	// keys when caseSensitive is false. Any record keys not declared in the
+	// metadata are appended in sorted order so create-table is deterministic
+	// and never silently drops record fields.
+	//
+	// When a record key matches a metadata field, the metadata's casing is
+	// what lands in the iceberg column — the record key is only used to look
+	// up the value. This keeps top-level naming consistent with how nested
+	// struct fields supplied via metadata are named.
+	orderedMetaNames, err := r.resolver.topLevelFieldOrder(common)
+	if err != nil {
+		return nil, err
+	}
+	used := make(map[string]struct{}, len(record))
+	finalOrder := make([]orderedField, 0, len(record))
+	for _, metaName := range orderedMetaNames {
+		recordKey, ok := matchRecordKey(record, metaName, r.caseSensitive)
+		if !ok {
+			// Field declared in schema metadata but absent from this record.
+			// Include it so resolveTypeForCreateTable can apply the metadata type.
+			finalOrder = append(finalOrder, orderedField{emitName: metaName, metadataOnly: true})
+			continue
+		}
+		if _, seen := used[recordKey]; seen {
+			continue
+		}
+		finalOrder = append(finalOrder, orderedField{recordKey: recordKey, emitName: metaName})
+		used[recordKey] = struct{}{}
+	}
+	for _, k := range slices.Sorted(maps.Keys(record)) {
+		if _, seen := used[k]; seen {
+			continue
+		}
+		finalOrder = append(finalOrder, orderedField{recordKey: k, emitName: k})
+	}
+
+	for _, f := range finalOrder {
+		var value any
+		if !f.metadataOnly {
+			value = record[f.recordKey]
+		}
+		fieldType, err := r.resolver.resolveTypeForCreateTable(f.emitName, value, msg, common, key.namespace, key.table, ti)
+		if err != nil {
+			return nil, fmt.Errorf("resolving type for field %q: %w", f.emitName, err)
+		}
+		if fieldType == nil {
+			continue // nil value, skip
+		}
+		fields = append(fields, iceberg.NestedField{
+			ID:       ti.allocateFieldID(), // For primitives this is the only allocation; for nested structs, inner IDs were already assigned by ti
+			Name:     f.emitName,
+			Type:     fieldType,
+			Required: false,
+		})
+	}
+
+	return r.schemaWithIdentifierFields(fields)
+}
+
+// schemaWithIdentifierFields builds the create-table schema, registering the
+// configured identifier_fields as the table's Iceberg identifier-field-ids so
+// that downstream engines and other writers see the row's primary key. Iceberg
+// requires identifier fields to be required and of a primitive, non-floating-
+// point type, so the matching columns are marked required here; a null or
+// missing value in an identifier column is consequently rejected on write
+// (consistent with how upsert/delete already reject null keys). A configured
+// identifier column that is absent from the created schema (not present in the
+// first message and not declared in schema_metadata) or of an unsuitable type
+// is a hard error rather than a silently unkeyed table.
+//
+// With no identifier_fields configured the schema is created exactly as before
+// (all columns optional, no identifier-field-ids), so append-only table
+// creation is unchanged.
+//
+// Under copy-on-write (merge_strategy: copy-on-write) the identifier_fields are
+// the connector-side merge key only and are deliberately NOT registered as the
+// table's Iceberg identifier-field-ids, nor are the columns forced required:
+// this is what lets engine-backed catalogs (e.g. the Databricks Unity Catalog)
+// accept the CREATE TABLE. Merge-on-read (the default) keeps registering them.
+func (r *Router) schemaWithIdentifierFields(fields []iceberg.NestedField) (*iceberg.Schema, error) {
+	if len(r.rowOpCfg.IdentifierFields) == 0 || r.rowOpCfg.MergeStrategy == mergeStrategyCOW {
+		return iceberg.NewSchema(0, fields...), nil
+	}
+
+	identifierIDs := make([]int, 0, len(r.rowOpCfg.IdentifierFields))
+	for _, name := range r.rowOpCfg.IdentifierFields {
+		idx := -1
+		for i := range fields {
+			if fields[i].Name == name || (!r.caseSensitive && strings.EqualFold(fields[i].Name, name)) {
+				idx = i
+				break
+			}
+		}
+		if idx < 0 {
+			return nil, fmt.Errorf("%s column %q is not present in the table being created; it must appear in the first message or be declared in schema_metadata", ioFieldIdentifierFields, name)
+		}
+		field := fields[idx]
+		if _, ok := field.Type.(iceberg.PrimitiveType); !ok {
+			return nil, fmt.Errorf("%s column %q has non-primitive type %s; identifier fields must be primitive", ioFieldIdentifierFields, field.Name, field.Type)
+		}
+		switch field.Type.(type) {
+		case iceberg.Float32Type, iceberg.Float64Type:
+			return nil, fmt.Errorf("%s column %q has floating-point type %s, which cannot be an identifier field", ioFieldIdentifierFields, field.Name, field.Type)
+		}
+		// Iceberg requires identifier fields to be required (non-null).
+		fields[idx].Required = true
+		identifierIDs = append(identifierIDs, field.ID)
+	}
+
+	return iceberg.NewSchemaWithIdentifiers(0, identifierIDs, fields...), nil
+}
+
+// orderedField pairs the key used to look up a value in the record with the
+// name that should land on the iceberg column. They differ in case-insensitive
+// mode when a metadata field matches a record key with different casing — the
+// metadata casing wins for the column, the record casing is needed to find the
+// value. When metadataOnly is true the field was declared in schema metadata but
+// is absent from the record; value is treated as nil and the column type comes
+// entirely from the metadata.
+type orderedField struct {
+	recordKey    string
+	emitName     string
+	metadataOnly bool
+}
+
+// matchRecordKey returns the actual key from record matching name, preserving
+// the record's casing. When caseSensitive is false, falls back to a case-folded
+// scan so schema-registry metadata authored with iceberg-canonical (typically
+// lowercase) names still matches arbitrarily-cased record keys.
+func matchRecordKey(record map[string]any, name string, caseSensitive bool) (string, bool) {
+	if _, ok := record[name]; ok {
+		return name, true
+	}
+	if caseSensitive {
+		return "", false
+	}
+	for k := range record {
+		if strings.EqualFold(k, name) {
+			return k, true
+		}
+	}
+	return "", false
+}
+
+// findCaseOnlyDuplicate returns the first pair of map keys that fold to the
+// same lowercase string, if any. Used by case-insensitive table creation to
+// reject input that would collapse to a single iceberg column.
+func findCaseOnlyDuplicate(record map[string]any) (string, string, bool) {
+	seen := make(map[string]string, len(record))
+	for name := range record {
+		lower := strings.ToLower(name)
+		if existing, ok := seen[lower]; ok {
+			return existing, name, true
+		}
+		seen[lower] = name
+	}
+	return "", "", false
+}
+
+// evolveSchema adds new columns to the table.
+func (r *Router) evolveSchema(ctx context.Context, key tableKey, schemaErr *BatchSchemaEvolutionError, batch service.MessageBatch, entry *tableEntry) error {
+	entry.mu.Lock()
+	defer entry.mu.Unlock()
+
+	nsParts := strings.Split(key.namespace, ".")
+	client, err := catalogx.NewCatalogClient(ctx, r.catalogCfg, nsParts)
+	if err != nil {
+		return fmt.Errorf("creating catalog client: %w", err)
+	}
+	defer client.Close()
+
+	// Load current table
+	tbl, err := client.LoadTable(ctx, key.table)
+	if err != nil {
+		return fmt.Errorf("loading table: %w", err)
+	}
+
+	// Resolve every new column's type before touching the table, so a column
+	// that must not be added fails the evolution without committing the rest.
+	columns, err := r.resolveNewColumns(schemaErr, batch[0], key)
+	if err != nil {
+		return err
+	}
+
+	// Update schema with new columns
+	_, err = client.UpdateSchema(ctx, tbl, r.caseSensitive, func(us *table.UpdateSchema) {
+		for _, col := range columns {
+			// Add column (all new columns are optional)
+			us.AddColumn(col.path, col.fieldType, "", false, nil)
+		}
+	})
+	if err != nil {
+		return fmt.Errorf("updating schema: %w", err)
+	}
+
+	r.logger.Infof("Evolved schema for %s.%s: added %d columns", key.namespace, key.table, len(columns))
+
+	// Invalidate cached writer so it gets recreated with the new schema
+	r.closeWriter(entry)
+	return nil
+}
+
+// newColumn is a column to add during schema evolution with its resolved type.
+type newColumn struct {
+	path      []string
+	fieldType iceberg.Type
+}
+
+// resolveNewColumns resolves the Iceberg type of each field in schemaErr with
+// resolveTypeForAddColumn. If the type cannot be resolved, the column falls
+// back to string. Nanosecond timestamps are the exception: they return an
+// error (see errNanosecondTimestamp).
+//
+// The asymmetry with create-table (where every resolve error fails) is
+// deliberate and narrow. For the other rejected types (time-of-day with
+// nanos or UTC adjustment, BigDecimal, Union) the string fallback is
+// long-standing behavior that running pipelines can depend on, so turning it
+// into a hard failure would stall them. Nanosecond timestamps previously
+// evolved into a column every write then failed against, so no working
+// pipeline relies on them and failing loudly breaks nothing.
+func (r *Router) resolveNewColumns(schemaErr *BatchSchemaEvolutionError, msg *service.Message, key tableKey) ([]newColumn, error) {
+	// Group new fields by parent path for efficient updates
+	groups := schemaErr.GroupByParentPath()
+
+	var columns []newColumn
+	for _, fields := range groups {
+		for _, field := range fields {
+			fieldType, err := r.resolver.resolveTypeForAddColumn(field, msg, key.namespace, key.table)
+			if errors.Is(err, errNanosecondTimestamp) {
+				return nil, fmt.Errorf("resolving type for field %v: %w", field.FullPath(), err)
+			}
+			if err != nil {
+				r.logger.Warnf("Failed to resolve type for field %q: %v, using string", field.FieldName(), err)
+				fieldType = iceberg.StringType{}
+			}
+
+			// Build column path
+			path := field.FullPath()
+			colPath := make([]string, len(path))
+			for i, seg := range path {
+				colPath[i] = seg.Name
+			}
+			columns = append(columns, newColumn{path: colPath, fieldType: fieldType})
+		}
+	}
+	return columns, nil
+}
+
+// makeColumnOptional changes a required column to optional in the table schema.
+func (r *Router) makeColumnOptional(ctx context.Context, key tableKey, reqNullErr *shredder.RequiredFieldNullError, entry *tableEntry) error {
+	entry.mu.Lock()
+	defer entry.mu.Unlock()
+
+	nsParts := strings.Split(key.namespace, ".")
+	client, err := catalogx.NewCatalogClient(ctx, r.catalogCfg, nsParts)
+	if err != nil {
+		return fmt.Errorf("creating catalog client: %w", err)
+	}
+	defer client.Close()
+
+	// Load current table
+	tbl, err := client.LoadTable(ctx, key.table)
+	if err != nil {
+		return fmt.Errorf("loading table: %w", err)
+	}
+
+	// Build column path from the error's path + field name.
+	// Only include PathField segments - skip PathListElement/PathMapEntry
+	// which don't correspond to named columns in the schema.
+	colPath := make([]string, 0, len(reqNullErr.Path)+1)
+	for _, seg := range reqNullErr.Path {
+		if seg.Kind == icebergx.PathField {
+			colPath = append(colPath, seg.Name)
+		}
+	}
+	colPath = append(colPath, reqNullErr.Field.Name)
+
+	// Update schema to make the column optional
+	_, err = client.UpdateSchema(ctx, tbl, r.caseSensitive, func(us *table.UpdateSchema) {
+		us.UpdateColumn(colPath, table.ColumnUpdate{
+			Required: iceberg.Optional[bool]{Val: false, Valid: true},
+		})
+	})
+	if err != nil {
+		return fmt.Errorf("updating schema: %w", err)
+	}
+
+	r.logger.Infof("Made column %q optional for %s.%s", reqNullErr.Field.Name, key.namespace, key.table)
+
+	// Invalidate cached writer so it gets recreated with the new schema
+	r.closeWriter(entry)
+	return nil
+}
+
+// closeWriter closes and nils the writer in an entry.
+// Caller must hold entry.mu.Lock().
+func (*Router) closeWriter(entry *tableEntry) {
+	if entry.writer != nil {
+		entry.writer.Close()
+		entry.writer = nil
+	}
+}
+
+// writerOptsFor returns the parquet writer options for one table: the options
+// configured on the output, plus that table's resolved compression codec.
+//
+// Compression is resolved per table because the fallback reads the table's own
+// write.parquet.compression-codec property, so two tables under one output can
+// legitimately land on different codecs.
+//
+// slices.Concat, not append: appending to r.writerOpts would hand successive
+// tables the same backing array whenever it has spare capacity, and each would
+// overwrite the previous table's codec option. Pinned by
+// TestWriterOptsForIsolatesTables.
+func (r *Router) writerOptsFor(key tableKey, props iceberg.Properties) []parquet.WriterOption {
+	codec, warning := resolveParquetCompression(r.parquetCompression, props)
+	if warning != "" {
+		r.warnCompressionOnce(key, warning)
+	}
+	return slices.Concat(r.writerOpts, []parquet.WriterOption{parquet.Compression(codec)})
+}
+
+// warnCompressionOnce logs a compression warning once per table and stays quiet
+// for that table afterwards. Writers are rebuilt whenever a write fails (see
+// closeWriter), so a retrying pipeline against a table whose property names an
+// unwritable codec would otherwise emit the same warning without bound.
+//
+// Keyed on the table as well as the message, because a router is inherently
+// multi-table — namespace and table are interpolated per message — so keying on
+// the message alone would report the first affected table and silently swallow
+// every other one. The message names the table for the same reason: otherwise
+// there is no way to tell whose data files went uncompressed.
+func (r *Router) warnCompressionOnce(key tableKey, warning string) {
+	if _, seen := r.warnedCompression.LoadOrStore(key.namespace+"\x00"+key.table+"\x00"+warning, struct{}{}); seen {
+		return
+	}
+	if r.logger != nil {
+		r.logger.Warnf("Table %s.%s: %s", key.namespace, key.table, warning)
+	}
+}
+
+// createWriter creates a new writer for a table.
+// Caller must hold entry.mu.Lock() and ensure entry.writer is nil.
+func (r *Router) createWriter(ctx context.Context, key tableKey, entry *tableEntry) (*writer, error) {
+	// Parse namespace into parts
+	nsParts := strings.Split(key.namespace, ".")
+
+	// Create catalog client for this namespace
+	client, err := catalogx.NewCatalogClient(ctx, r.catalogCfg, nsParts)
+	if err != nil {
+		return nil, fmt.Errorf("creating catalog client: %w", err)
+	}
+	defer client.Close()
+
+	// Load the table twice - writer and committer need separate references
+	// since the table object is mutable and they operate in different goroutines
+	writerTbl, err := client.LoadTable(ctx, key.table)
+	if err != nil {
+		// Return the error directly - the retry loop will handle it
+		return nil, err
+	}
+
+	// The standard table property commit.retry.num-retries arms iceberg-go's
+	// OWN refresh-and-replay retry loop inside every commit. That replay
+	// re-submits the ORIGINAL updates with only the ref requirement rewritten
+	// — a replayed snapshot's manifest list was built against the old base, so
+	// under concurrent writers a peer's non-conflicting commit can be dropped
+	// from the table state. This committer's retry loop already re-stages
+	// safely from a reloaded snapshot, making the inner loop pure risk here.
+	// Warn (once per table per process) rather than refuse: the property is
+	// legitimately set on tables other engines also write.
+	if n := writerTbl.Properties()[table.CommitNumRetriesKey]; n != "" && n != "0" && !entry.retryPropWarned {
+		entry.retryPropWarned = true
+		r.logger.Warnf("Table %v carries %s=%s, which arms the Iceberg library's internal commit replay; this output's own commit retry already re-stages safely, and the library-level replay can drop a concurrent writer's commit — consider unsetting the property on tables this output writes to", key.table, table.CommitNumRetriesKey, n)
+	}
+
+	// reloadTable creates a fresh catalog client and reloads the table,
+	// allowing the committer to recover from stale metadata or auth errors.
+	reloadTable := func(ctx context.Context) (*table.Table, error) {
+		rc, err := catalogx.NewCatalogClient(ctx, r.catalogCfg, nsParts)
+		if err != nil {
+			return nil, fmt.Errorf("creating catalog client for table reload: %w", err)
+		}
+		defer rc.Close()
+		return rc.LoadTable(ctx, key.table)
+	}
+
+	// Resolve the table's timestamp encoding before any file is written, so
+	// every parquet file this writer produces matches the table's existing
+	// annotation. When the pinning property is present on the freshly loaded
+	// table it is authoritative and re-read on every writer (re)creation —
+	// this is metadata already in hand, and it means an operator who migrates
+	// a table (rewrite files, flip the property to spec) is honoured at the
+	// next writer recreation rather than being overridden by a stale cache.
+	// The entry cache (guarded by entry.mu, which we hold) only short-circuits
+	// the property-ABSENT bootstrap, so the footer probe and pinning stamp run
+	// at most once per table per process.
+	if _, propPresent := writerTbl.Properties()[icebergx.TimestampEncodingProperty]; propPresent || !entry.tsEncodingResolved {
+		// A probe-bound failure is deterministic per snapshot: serve the
+		// cached error instead of re-paying the full footer scan on every
+		// retried write (see tableEntry.tsEncodingProbeErr).
+		if !propPresent {
+			if cached := entry.cachedProbeErr(writerTbl); cached != nil {
+				return nil, cached
+			}
+		}
+		enc, stampedTbl, err := resolveTimestampEncoding(ctx, writerTbl, reloadTable, r.logger)
+		if err != nil {
+			if entry.noteProbeErr(writerTbl, err) {
+				r.logger.Warnf("Timestamp-encoding probe for table %v hit its %d-file bound; refusing writes until the %s table property is set (or new data files land) — this result is cached, so retries will not re-scan", key.table, maxProbedFiles, icebergx.TimestampEncodingProperty)
+			}
+			return nil, err
+		}
+		entry.tsEncoding = enc
+		entry.tsEncodingResolved = true
+		writerTbl = stampedTbl
+	}
+
+	committerTbl, err := client.LoadTable(ctx, key.table)
+	if err != nil {
+		return nil, err
+	}
+
+	// Create committer with its own table reference. Copy-on-write writes only
+	// plain data files, so it works on a v1 table and must not trigger the
+	// irreversible v1->v2 upgrade the merge-on-read path needs.
+	commitCfg := r.commitCfg
+	commitCfg.SkipFormatUpgrade = r.rowOpCfg.MergeStrategy == mergeStrategyCOW
+	// Seed the committer with the entry's persistent prohibited-key set (we
+	// hold entry.mu), so property keys a catalog rejection taught a previous
+	// committer stay stripped after writer recreation instead of costing one
+	// rejected commit per writer generation.
+	if entry.prohibitedProps == nil {
+		entry.prohibitedProps = newProhibitedKeySet()
+	}
+	commitCfg.ProhibitedKeys = entry.prohibitedProps
+	comm, err := NewCommitter(committerTbl, client.TableIO(), commitCfg, reloadTable, r.logger)
+	if err != nil {
+		return nil, fmt.Errorf("creating committer: %w", err)
+	}
+	comm.metrics = r.metrics
+
+	// Create writer with its own table reference and the committer.
+	// The resolver is passed so the writer can use schema metadata to
+	// interpret numeric inputs into time-typed columns at shredding time.
+	// Surface copy-on-write configuration-vs-table conflicts at writer
+	// creation rather than on the first mutating batch — but ONLY for
+	// configurations that can actually mutate. A static `row_operation:
+	// insert` never touches the merge-key or delete-mode machinery, and a
+	// previously-healthy insert-only pipeline must not go down because its
+	// unused identifier_fields column has an unsupported type; mutating() is
+	// false exactly for that class. A dynamic row_operation CAN mutate, but
+	// may in practice never do so, so it gets a WARNING here and the
+	// authoritative error on the first mutating batch. A static upsert/delete
+	// gets the hard error: no batch it produces can ever succeed. Columns
+	// missing from the schema are deliberately not checked at all (the
+	// mutation paths report those with full context).
+	if r.rowOpCfg.MergeStrategy == mergeStrategyCOW && r.rowOpCfg.mutating() {
+		_, staticOp := r.rowOpCfg.Operation.Static()
+		tblSchema := writerTbl.Schema()
+		for _, name := range r.rowOpCfg.IdentifierFields {
+			if field, ok := findSchemaField(tblSchema, name, r.caseSensitive); ok {
+				if err := cowKeyTypeSupported(name, field.Type); err != nil {
+					if staticOp {
+						return nil, err
+					}
+					r.logger.Warnf("Copy-on-write merge key check: %v — every upsert/delete batch will fail until the configuration or table schema changes", err)
+				}
+			}
+		}
+		// The same fail-fast for an explicit write.delete.mode conflict: the
+		// per-commit stage check remains the backstop, but a static mutating
+		// config against a table explicitly pinned to merge-on-read deletes
+		// can never commit a mutation, and surfacing that only per attempt
+		// would nack/redeliver forever.
+		if mode := writerTbl.Properties()[table.WriteDeleteModeKey]; mode != "" && mode != table.WriteModeCopyOnWrite {
+			err := fmt.Errorf("table property %s is explicitly set to %q, which conflicts with merge_strategy: copy-on-write; unset the property (or set it to %q), or switch this output to merge_strategy: merge-on-read", table.WriteDeleteModeKey, mode, table.WriteModeCopyOnWrite)
+			if staticOp {
+				return nil, err
+			}
+			r.logger.Warnf("Copy-on-write delete-mode check: %v — every upsert/delete batch will fail until resolved", err)
+		}
+	}
+
+	w := NewWriter(writerTbl, comm, r.caseSensitive, r.writerOptsFor(key, writerTbl.Properties()), r.resolver, r.schemaEvoCfg.RequireSchemaMetadata, r.rowOpCfg, entry.tsEncoding, r.logger)
+	w.metrics = r.metrics
+	r.logger.Debugf("Created writer for table %s.%s", key.namespace, key.table)
+
+	return w, nil
+}
+
+// Close closes all cached writers.
+func (r *Router) Close() {
+	r.entries.Range(func(k, v any) bool {
+		key := k.(tableKey)
+		entry := v.(*tableEntry)
+		entry.mu.Lock()
+		if entry.writer != nil {
+			entry.writer.Close()
+			entry.writer = nil
+			r.logger.Debugf("Closed writer for table %s.%s", key.namespace, key.table)
+		}
+		entry.mu.Unlock()
+		return true
+	})
+}

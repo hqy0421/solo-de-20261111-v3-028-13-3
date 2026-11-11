@@ -1,0 +1,343 @@
+// Copyright 2026 Redpanda Data, Inc.
+//
+// Licensed as a Redpanda Enterprise file under the Redpanda Community
+// License (the "License"); you may not use this file except in compliance with
+// the License. You may obtain a copy of the License at
+//
+// https://github.com/redpanda-data/connect/blob/main/licenses/rcl.md
+
+package sqlredo
+
+import (
+	"bytes"
+	"encoding/json"
+	"fmt"
+	"maps"
+	"math"
+	"slices"
+	"strings"
+	"time"
+
+	"github.com/redpanda-data/benthos/v4/public/service"
+)
+
+// FormatPKString returns a deterministic string representation of a PK values
+// map suitable for use as a map key. Keys are sorted alphabetically and values
+// are formatted as "K1=V1;K2=V2".
+func FormatPKString(pkValues map[string]any) string {
+	keys := slices.Sorted(maps.Keys(pkValues))
+	parts := make([]string, 0, len(keys))
+	for _, k := range keys {
+		parts = append(parts, k+"="+fmt.Sprintf("%v", pkValues[k]))
+	}
+	return strings.Join(parts, ";")
+}
+
+// LobKey uniquely identifies a LOB accumulator within a transaction.
+// PKString is a stable string representation of the PK values map used as a map key.
+type LobKey struct {
+	Schema   string
+	Table    string
+	Column   string
+	PKString string
+}
+
+// LobFragment is a single LOB_WRITE chunk with its 1-based Oracle offset.
+type LobFragment struct {
+	Offset int64
+	Data   []byte
+}
+
+// LobAccumulator collects LOB_WRITE fragments for a single LOB column value
+// and assembles them into the complete value on commit.
+type LobAccumulator struct {
+	Schema    string
+	Table     string
+	Column    string
+	IsBinary  bool
+	PKValues  map[string]any
+	Fragments []LobFragment
+}
+
+// AddFragment appends a fragment.
+func (a *LobAccumulator) AddFragment(offset int64, data []byte) {
+	a.Fragments = append(a.Fragments, LobFragment{Offset: offset, Data: data})
+}
+
+// usableOffset reports whether the fragment's 1-based offset can be positioned
+// without indexing negatively (offset < 1) or overflowing int64 when computing its
+// end position. Oracle LOB offsets are 1-based and bounded by the LOB size, so only
+// corrupted redo fails this check.
+//
+// NOTE: this guards the two arithmetic crash paths (negative index, int64 overflow)
+// but does not bound the resulting allocation: a corrupt-but-non-overflowing offset
+// (e.g. 1<<50) still drives Assemble's make([]byte, totalLen) to panic/OOM. Fully
+// closing that requires a maximum-LOB-size policy and is tracked as a follow-up;
+// legitimate Oracle output never produces such an offset.
+func (f LobFragment) usableOffset() bool {
+	return f.Offset >= 1 && f.Offset-1 <= math.MaxInt64-int64(len(f.Data))
+}
+
+// Assemble assembles all fragments into the final column value:
+//   - BLOB → []byte (raw bytes, gaps zero-filled)
+//   - CLOB → string (plain string, gaps space-filled)
+//   - NCLOB → string (plain string from LOB_WRITE string literal, gaps space-filled)
+//
+// Returns nil when no fragments have been added.
+func (a *LobAccumulator) Assemble() any {
+	if len(a.Fragments) == 0 {
+		return nil
+	}
+
+	var totalLen int64
+	for _, f := range a.Fragments {
+		if !f.usableOffset() {
+			continue // skip malformed offsets (< 1 or overflowing) rather than crashing
+		}
+		end := (f.Offset - 1) + int64(len(f.Data))
+		if end > totalLen {
+			totalLen = end
+		}
+	}
+
+	result := make([]byte, totalLen)
+	if !a.IsBinary {
+		// Fill with spaces for CLOB/NCLOB gaps.
+		for i := range result {
+			result[i] = ' '
+		}
+	}
+
+	for _, f := range a.Fragments {
+		if !f.usableOffset() {
+			continue
+		}
+		start := f.Offset - 1 // convert 1-based offset to 0-based
+		copy(result[start:], f.Data)
+	}
+
+	switch {
+	case a.IsBinary:
+		return result
+	default:
+		// CLOB and NCLOB: Oracle delivers data as plain string literals in LOB_WRITE SQL.
+		return string(result)
+	}
+}
+
+// TxnLOBState tracks LOB accumulation state for a single in-flight transaction.
+type TxnLOBState struct {
+	ActiveKey    *LobKey
+	Accumulators map[LobKey]*LobAccumulator
+}
+
+// NewTxnLOBState creates a new TxnLOBState.
+func NewTxnLOBState() *TxnLOBState {
+	return &TxnLOBState{Accumulators: make(map[LobKey]*LobAccumulator)}
+}
+
+// MergeLOBsIntoDMLEvents matches each LOB accumulator to its corresponding DML
+// event (by schema, table, and PK values) and overwrites the LOB column value
+// with the assembled data. It returns any accumulators whose data could not be
+// merged — the caller should synthesize DML events for these (see logminer.go).
+//
+// For small LOBs stored inline, Oracle emits both the original INSERT (with empty
+// LOB placeholders) and a subsequent LOB-initialisation UPDATE (with only LOB columns).
+// To ensure the LOB values land on the INSERT rather than the UPDATE, this function
+// first searches forward for an INSERT event with a matching PK, then falls back to
+// the most-recent matching DML event of any type.
+//
+// Oracle SecureFile out-of-row LOBs may emit only SELECT_LOB_LOCATOR + LOB_WRITE +
+// LOB_TRIM with no DML UPDATE. In that case all three passes find nothing and the
+// accumulator is returned as unmerged so the caller can synthesize a synthetic UPDATE.
+func MergeLOBsIntoDMLEvents(state *TxnLOBState, events []*DMLEvent, log *service.Logger) []*LobAccumulator {
+	logDebugf := func(msg string, args ...any) {
+		if log != nil {
+			log.Debugf(msg, args...)
+		}
+	}
+	logWarnf := func(msg string, args ...any) {
+		if log != nil {
+			log.Warnf(msg, args...)
+		}
+	}
+
+	var unmerged []*LobAccumulator
+
+	for _, acc := range state.Accumulators {
+		assembled := acc.Assemble()
+		if assembled == nil {
+			logDebugf("LOB merge: skipping %s.%s.%s — no fragments accumulated", acc.Schema, acc.Table, acc.Column)
+			continue
+		}
+
+		merged := false
+
+		// Pass 1: prefer an INSERT event with matching PK so that Oracle's
+		// LOB-initialisation UPDATE does not shadow the original INSERT.
+		for i := range events {
+			ev := events[i]
+			if ev.Operation != OpInsert {
+				continue
+			}
+			if ev.Schema != acc.Schema || ev.Table != acc.Table {
+				continue
+			}
+			if pkMatches(ev.Data, acc.PKValues) {
+				ev.Data[acc.Column] = assembled
+				merged = true
+				logDebugf("LOB merge: set %s.%s.%s into INSERT (pks=%v, fragments=%d)", acc.Schema, acc.Table, acc.Column, acc.PKValues, len(acc.Fragments))
+				break
+			}
+		}
+
+		if merged {
+			continue
+		}
+
+		// Pass 2: fall back to the most-recent DML event of any type with a matching PK.
+		// For LOB-only UPDATE events the SET clause contains only LOB columns, so
+		// PK columns are not in ev.Data — they are in ev.OldValues (WHERE clause).
+		for _, ev := range slices.Backward(events) {
+
+			if ev.Schema != acc.Schema || ev.Table != acc.Table {
+				continue
+			}
+			if pkMatches(ev.Data, acc.PKValues) || pkMatches(ev.OldValues, acc.PKValues) {
+				ev.Data[acc.Column] = assembled
+				merged = true
+				logDebugf("LOB merge: set %s.%s.%s (pks=%v, fragments=%d)", acc.Schema, acc.Table, acc.Column, acc.PKValues, len(acc.Fragments))
+				break
+			}
+		}
+
+		if merged {
+			continue
+		}
+
+		// Pass 3: schema/table-only fallback. Oracle SecureFile LOB-init UPDATEs
+		// sometimes carry only ROWID in their WHERE clause (no PK columns), making
+		// PK matching impossible. Only merge when exactly one candidate event exists
+		// for this table; if multiple exist, rows cannot be distinguished and the
+		// accumulator is left unmerged so the caller synthesizes a separate UPDATE.
+		var candidates []*DMLEvent
+		for i := range events {
+			ev := events[i]
+			if ev.Schema == acc.Schema && ev.Table == acc.Table {
+				candidates = append(candidates, ev)
+			}
+		}
+		switch len(candidates) {
+		case 1:
+			candidates[0].Data[acc.Column] = assembled
+			merged = true
+			logDebugf("LOB merge: set %s.%s.%s via schema/table fallback (fragments=%d)", acc.Schema, acc.Table, acc.Column, len(acc.Fragments))
+		case 0:
+			// no candidates — fall through to unmerged
+		default:
+			logWarnf("LOB merge: %s.%s.%s has %d candidate events with no PK in WHERE clause — cannot distinguish rows; will synthesize UPDATE", acc.Schema, acc.Table, acc.Column, len(candidates))
+		}
+
+		if !merged {
+			logDebugf("LOB merge: no matching DML event for %s.%s.%s (pks=%v) — will synthesize UPDATE", acc.Schema, acc.Table, acc.Column, acc.PKValues)
+			unmerged = append(unmerged, acc)
+		}
+	}
+
+	return unmerged
+}
+
+// MergeInlineLOBValues merges LOB column values from an inline-LOB-only UPDATE into the
+// matching INSERT event for the same row, reporting whether a matching INSERT was found.
+// The pkValues parameter (sourced from the WHERE clause of the LOB-init UPDATE) is used
+// to identify the correct INSERT event. When pkValues is empty, all INSERT events for
+// schema.table are updated as a fallback.
+//
+// This handles Oracle's behaviour of omitting LOB columns from INSERT SQL_REDO and
+// instead emitting a separate UPDATE whose SET clause carries the actual LOB data. The
+// caller must check the return value: a false result means the LOB-only UPDATE is still
+// the only place this row's LOB data lives, and must not be suppressed as "already merged".
+func MergeInlineLOBValues(lobData map[string]any, schema, table string, pkValues map[string]any, events []*DMLEvent, log *service.Logger) bool {
+	merged := false
+	for _, ev := range events {
+		if ev.Operation != OpInsert {
+			continue
+		}
+		if ev.Schema != schema || ev.Table != table {
+			continue
+		}
+		if len(pkValues) > 0 && !pkMatches(ev.Data, pkValues) {
+			continue
+		}
+		for col, val := range lobData {
+			// Skip EMPTY_CLOB()/EMPTY_BLOB() placeholders. Oracle emits these in
+			// a LOB-init UPDATE before writing the real data via SELECT_LOB_LOCATOR
+			// + LOB_WRITE. The real value is already merged by MergeLOBsIntoDMLEvents;
+			// overwriting it here would clobber the assembled LOB_WRITE data.
+			if b, ok := val.([]byte); ok && len(b) == 0 {
+				continue
+			}
+			ev.Data[col] = val
+		}
+		merged = true
+		if log != nil {
+			log.Debugf("inline LOB merge: set %d LOB columns into INSERT for %s.%s (pks=%v)", len(lobData), schema, table, pkValues)
+		}
+	}
+	return merged
+}
+
+// pkMatches returns true when every key in pkValues is present in data and the
+// string representations are equal.
+//
+// An empty pkValues set returns false rather than vacuously matching: a
+// ROWID-only SELECT_LOB_LOCATOR yields no PK values, and treating that as a match
+// against the first candidate event would merge the LOB into an arbitrary row.
+// Returning false forces callers to fall back to the schema/table disambiguation
+// (see MergeLOBsIntoDMLEvents Pass 3).
+func pkMatches(data map[string]any, pkValues map[string]any) bool {
+	if len(pkValues) == 0 {
+		return false
+	}
+	for k, pkVal := range pkValues {
+		dataVal, ok := data[k]
+		if !ok {
+			return false
+		}
+		if !valuesEqual(dataVal, pkVal) {
+			return false
+		}
+	}
+	return true
+}
+
+// valuesEqual reports whether a and b format identically with %v. Common
+// same-typed values are compared directly to avoid the allocations of
+// formatting, since nearly all PK comparisons are mismatches.
+func valuesEqual(a, b any) bool {
+	switch x := a.(type) {
+	case string:
+		if y, ok := b.(string); ok {
+			return x == y
+		}
+	case int64:
+		if y, ok := b.(int64); ok {
+			return x == y
+		}
+	case json.Number:
+		if y, ok := b.(json.Number); ok {
+			return x == y
+		}
+	case []byte:
+		if y, ok := b.([]byte); ok {
+			return bytes.Equal(x, y)
+		}
+	case time.Time:
+		if y, ok := b.(time.Time); ok && x.Location() == y.Location() {
+			// Both hold a time.Time, so == compares the instant and the
+			// monotonic reading, which %v prints and Equal ignores.
+			return a == b
+		}
+	}
+	return fmt.Sprintf("%v", a) == fmt.Sprintf("%v", b)
+}

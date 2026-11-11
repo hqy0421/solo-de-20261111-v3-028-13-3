@@ -1,0 +1,183 @@
+// Copyright 2026 Redpanda Data, Inc.
+//
+// Licensed as a Redpanda Enterprise file under the Redpanda Community
+// License (the "License"); you may not use this file except in compliance with
+// the License. You may obtain a copy of the License at
+//
+// https://github.com/redpanda-data/connect/blob/main/licenses/rcl.md
+
+package logminer
+
+import (
+	"context"
+	"math"
+
+	"github.com/redpanda-data/benthos/v4/public/service"
+	"github.com/redpanda-data/connect/v4/internal/impl/oracledb/logminer/sqlredo"
+)
+
+// TransactionCache is responsible for buffering transactions until a commit event is received,
+// at which point we know it's safe to flush transactions to the Connect pipeline.
+// If a rollback events is received the cache will be be cleared instead of flushed.
+type TransactionCache interface {
+	StartTransaction(ctx context.Context, txnID sqlredo.TransactionID, scn uint64) error
+	AddEvent(ctx context.Context, txnID sqlredo.TransactionID, scn uint64, event *sqlredo.DMLEvent) error
+	GetTransaction(ctx context.Context, txnID sqlredo.TransactionID) (*Transaction, error)
+	CommitTransaction(ctx context.Context, txnID sqlredo.TransactionID) error
+	RollbackTransaction(ctx context.Context, txnID sqlredo.TransactionID) error
+	// LowWatermarkSCN returns the lowest start SCN of open transactions, excluding
+	// excludeTxnID, or math.MaxUint64 if there are none. The commit checkpoint
+	// stays below it so a restart re-mines those transactions. Only transactions
+	// with DML events, or marked with IncludeInLowWatermark, count, so that
+	// transactions on unmonitored tables don't hold the checkpoint back.
+	LowWatermarkSCN(excludeTxnID sqlredo.TransactionID) uint64
+	// IncludeInLowWatermark makes LowWatermarkSCN count an open transaction
+	// without DML events, such as one with only LOB events. LogMiner may not
+	// rebuild LOB operations if mining starts after the transaction's START.
+	// It is idempotent and a no-op for missing or discarded transactions.
+	IncludeInLowWatermark(ctx context.Context, txnID sqlredo.TransactionID) error
+}
+
+// Transaction buffers events until commit
+type Transaction struct {
+	ID     sqlredo.TransactionID
+	SCN    uint64
+	Events []*sqlredo.DMLEvent
+
+	// holdsWatermark makes LowWatermarkSCN count the transaction even
+	// without DML events.
+	holdsWatermark bool
+}
+
+// InMemoryCache is an in-memory implementation of TransactionCache that stores
+// transactions in a map. This cache is used to buffer DML events until a transaction
+// commits or rolls back. All operations are sequential and not protected by locks.
+type InMemoryCache struct {
+	transactions         map[sqlredo.TransactionID]*Transaction
+	discardedTxns        map[sqlredo.TransactionID]struct{}
+	maxTransactionEvents int
+	transactionsMetric   *service.MetricGauge
+	eventsMetric         *service.MetricGauge
+	log                  *service.Logger
+}
+
+// NewInMemoryCache creates a new in-memory transaction cache with the specified logger.
+// The cache buffers transactions until they commit or rollback. maxTransactionEvents
+// sets the maximum number of events per transaction before it is discarded; 0 disables the limit.
+func NewInMemoryCache(maxTransactionEvents int, metrics *service.Metrics, logger *service.Logger) *InMemoryCache {
+	return &InMemoryCache{
+		transactions:         make(map[sqlredo.TransactionID]*Transaction),
+		discardedTxns:        make(map[sqlredo.TransactionID]struct{}),
+		maxTransactionEvents: maxTransactionEvents,
+		transactionsMetric:   metrics.NewGauge("oracledb_cdc_transactions_active"),
+		eventsMetric:         metrics.NewGauge("oracledb_cdc_transactions_events_inflight"),
+		log:                  logger,
+	}
+}
+
+// StartTransaction initializes a new transaction in the cache with the given transaction ID and SCN.
+// If the transaction already exists in the cache it is left untouched so that previously
+// accumulated events are not lost when LogMiner re-emits the START record across polling cycles.
+func (tc *InMemoryCache) StartTransaction(_ context.Context, txnID sqlredo.TransactionID, scn uint64) error {
+	if _, discarded := tc.discardedTxns[txnID]; discarded {
+		return nil
+	}
+	if _, exists := tc.transactions[txnID]; exists {
+		return nil
+	}
+	tc.transactions[txnID] = &Transaction{
+		ID:     txnID,
+		SCN:    scn,
+		Events: []*sqlredo.DMLEvent{},
+	}
+	tc.transactionsMetric.Incr(1)
+	return nil
+}
+
+// AddEvent adds a DML event to the specified transaction's buffer.
+// If the transaction doesn't exist, it creates a new transaction with the event.
+// If maxTransactionEvents is set and the buffer exceeds it, the transaction is discarded.
+func (tc *InMemoryCache) AddEvent(_ context.Context, txnID sqlredo.TransactionID, scn uint64, event *sqlredo.DMLEvent) error {
+	if _, discarded := tc.discardedTxns[txnID]; discarded {
+		return nil
+	}
+	if txn, exists := tc.transactions[txnID]; exists {
+		txn.Events = append(txn.Events, event)
+		tc.eventsMetric.Incr(1)
+
+		if tc.maxTransactionEvents > 0 && len(txn.Events) > tc.maxTransactionEvents {
+			tc.log.Warnf("Transaction %s exceeded max event buffer of %d events, discarding", txnID, tc.maxTransactionEvents)
+			tc.eventsMetric.Decr(int64(len(txn.Events)))
+			delete(tc.transactions, txnID)
+			tc.transactionsMetric.Decr(1)
+			tc.discardedTxns[txnID] = struct{}{}
+		}
+	} else {
+		// After a restart, the checkpoint can be past the START of a
+		// transaction with no monitored events yet (LowWatermarkSCN skips
+		// it). All its monitored events are after the checkpoint.
+		tc.log.Debugf("Starting transaction %s at SCN %d, its START is before the resume position", txnID, scn)
+		t := &Transaction{
+			ID:     txnID,
+			SCN:    scn,
+			Events: []*sqlredo.DMLEvent{event},
+		}
+		tc.transactions[txnID] = t
+		tc.transactionsMetric.Incr(1)
+		tc.eventsMetric.Incr(1)
+	}
+	return nil
+}
+
+// GetTransaction retrieves the transaction with the given ID from the cache.
+// Returns (nil, nil) if the transaction doesn't exist.
+func (tc *InMemoryCache) GetTransaction(_ context.Context, txnID sqlredo.TransactionID) (*Transaction, error) {
+	return tc.transactions[txnID], nil
+}
+
+// CommitTransaction removes the committed transaction from the cache.
+func (tc *InMemoryCache) CommitTransaction(_ context.Context, txnID sqlredo.TransactionID) error {
+	delete(tc.discardedTxns, txnID)
+	tx, ok := tc.transactions[txnID]
+	if !ok {
+		return nil
+	}
+	tc.eventsMetric.Decr(int64(len(tx.Events)))
+	delete(tc.transactions, txnID)
+	tc.transactionsMetric.Decr(1)
+	return nil
+}
+
+// LowWatermarkSCN returns the lowest start SCN among all currently open
+// (uncommitted) transactions. Returns math.MaxUint64 if no open transactions.
+func (tc *InMemoryCache) LowWatermarkSCN(excludeTxnID sqlredo.TransactionID) uint64 {
+	lowestOpenSCN := uint64(math.MaxUint64)
+	for id, txn := range tc.transactions {
+		if id != excludeTxnID && (len(txn.Events) > 0 || txn.holdsWatermark) {
+			lowestOpenSCN = min(lowestOpenSCN, txn.SCN)
+		}
+	}
+	return lowestOpenSCN
+}
+
+// IncludeInLowWatermark marks an open transaction so that LowWatermarkSCN
+// counts it even without DML events.
+func (tc *InMemoryCache) IncludeInLowWatermark(_ context.Context, txnID sqlredo.TransactionID) error {
+	if txn, exists := tc.transactions[txnID]; exists {
+		txn.holdsWatermark = true
+	}
+	return nil
+}
+
+// RollbackTransaction removes the rolled back transaction from the cache, discarding all buffered events.
+func (tc *InMemoryCache) RollbackTransaction(_ context.Context, txnID sqlredo.TransactionID) error {
+	delete(tc.discardedTxns, txnID)
+	tx, ok := tc.transactions[txnID]
+	if !ok {
+		return nil
+	}
+	tc.eventsMetric.Decr(int64(len(tx.Events)))
+	delete(tc.transactions, txnID)
+	tc.transactionsMetric.Decr(1)
+	return nil
+}

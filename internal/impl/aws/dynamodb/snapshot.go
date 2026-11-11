@@ -1,0 +1,435 @@
+// Copyright 2026 Redpanda Data, Inc.
+//
+// Licensed as a Redpanda Enterprise file under the Redpanda Community
+// License (the "License"); you may not use this file except in compliance with
+// the License. You may obtain a copy of the License at
+//
+// https://github.com/redpanda-data/connect/blob/main/licenses/rcl.md
+
+package dynamodb
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"sync"
+	"sync/atomic"
+	"time"
+
+	"github.com/aws/aws-sdk-go-v2/aws"
+	"github.com/aws/aws-sdk-go-v2/aws/retry"
+	"github.com/aws/aws-sdk-go-v2/service/dynamodb"
+	dynamodbtypes "github.com/aws/aws-sdk-go-v2/service/dynamodb/types"
+	streamstypes "github.com/aws/aws-sdk-go-v2/service/dynamodbstreams/types"
+	"github.com/aws/smithy-go"
+	smithytime "github.com/aws/smithy-go/time"
+	"github.com/cenkalti/backoff/v4"
+	"golang.org/x/sync/errgroup"
+
+	"github.com/redpanda-data/benthos/v4/public/service"
+)
+
+// DynamoItems is a slice of DynamoDB attribute maps representing table items.
+type DynamoItems = []map[string]dynamodbtypes.AttributeValue
+
+// SnapshotScannerConfig holds configuration for snapshot scanning.
+type SnapshotScannerConfig struct {
+	Client     *dynamodb.Client
+	Table      string
+	Segments   int
+	BatchSize  int
+	Throttle   time.Duration
+	MaxBackoff time.Duration // Maximum backoff on throttling errors (0 = no limit).
+	Logger     *service.Logger
+}
+
+// SnapshotScanner performs a parallel scan of a DynamoDB table using the
+// DynamoDB Scan API with configurable segment parallelism. It supports
+// resumable checkpointing, adaptive backoff on throttling, and reports
+// progress through user-supplied callbacks.
+type SnapshotScanner struct {
+	client     *dynamodb.Client
+	table      string
+	segments   int
+	batchSize  int
+	throttle   time.Duration
+	maxBackoff time.Duration
+	log        *service.Logger
+
+	// Callbacks. Progress persistence is NOT the scanner's job: batches carry
+	// their scan resume position (lastKey) to the batch callback, and the
+	// consumer persists positions only after downstream acknowledgement.
+	onBatch           func(ctx context.Context, items DynamoItems, segment int, lastKey map[string]dynamodbtypes.AttributeValue) error
+	onProgress        func(segment, totalSegments int, recordsRead int64)
+	onSegmentSealed   func(ctx context.Context, segment int) error
+	onSegmentComplete func(segment int, duration time.Duration, recordsRead int64)
+
+	// State tracking
+	activeSegments atomic.Int32
+}
+
+// NewSnapshotScanner creates a new snapshot scanner.
+func NewSnapshotScanner(conf SnapshotScannerConfig) *SnapshotScanner {
+	return &SnapshotScanner{
+		client:     conf.Client,
+		table:      conf.Table,
+		segments:   conf.Segments,
+		batchSize:  conf.BatchSize,
+		throttle:   conf.Throttle,
+		maxBackoff: conf.MaxBackoff,
+		log:        conf.Logger,
+	}
+}
+
+// SetBatchCallback sets the callback for processing batches of items. lastKey
+// is the scan position after the batch (nil when the batch ends the segment);
+// it is the only position safe to persist once the batch is acknowledged.
+func (s *SnapshotScanner) SetBatchCallback(fn func(ctx context.Context, items DynamoItems, segment int, lastKey map[string]dynamodbtypes.AttributeValue) error) {
+	s.onBatch = fn
+}
+
+// SetProgressCallback sets the callback for progress updates.
+func (s *SnapshotScanner) SetProgressCallback(fn func(segment, totalSegments int, recordsRead int64)) {
+	s.onProgress = fn
+}
+
+// SetSegmentSealedCallback sets the callback fired when a segment's scan has
+// emitted its last batch, so the consumer can register the segment-complete
+// marker behind all of the segment's in-flight batches.
+func (s *SnapshotScanner) SetSegmentSealedCallback(fn func(ctx context.Context, segment int) error) {
+	s.onSegmentSealed = fn
+}
+
+// SetSegmentCompleteCallback sets the callback for segment completion with duration tracking.
+func (s *SnapshotScanner) SetSegmentCompleteCallback(fn func(segment int, duration time.Duration, recordsRead int64)) {
+	s.onSegmentComplete = fn
+}
+
+// ActiveSegments returns the current number of active scan segments.
+func (s *SnapshotScanner) ActiveSegments() int {
+	return int(s.activeSegments.Load())
+}
+
+// Scan performs the snapshot scan, optionally resuming from a checkpoint.
+func (s *SnapshotScanner) Scan(ctx context.Context, resume *SnapshotCheckpoint) error {
+	if s.onBatch == nil {
+		return errors.New("batch callback must be set before scanning")
+	}
+
+	g, ctx := errgroup.WithContext(ctx)
+	g.SetLimit(s.segments)
+
+	s.log.Infof("Starting snapshot scan with %d segments", s.segments)
+
+	// Start a goroutine for each segment, skipping already-completed segments.
+	for segment := 0; segment < s.segments; segment++ {
+		segmentID := segment
+
+		if resume.SegmentComplete(segmentID) {
+			s.log.Debugf("Skipping already-completed segment %d", segmentID)
+			continue
+		}
+
+		startKey := resume.SegmentStartKey(segmentID)
+
+		g.Go(func() error {
+			return s.scanSegment(ctx, segmentID, startKey)
+		})
+	}
+
+	// Wait for all segments to complete
+	if err := g.Wait(); err != nil {
+		return fmt.Errorf("snapshot scan failed: %w", err)
+	}
+
+	s.log.Info("Snapshot scan completed successfully")
+	return nil
+}
+
+// scanSegment scans a single segment of the table.
+func (s *SnapshotScanner) scanSegment(ctx context.Context, segment int, startKey map[string]dynamodbtypes.AttributeValue) error {
+	s.activeSegments.Add(1)
+	defer s.activeSegments.Add(-1)
+
+	startTime := time.Now()
+	s.log.Debugf("Starting scan for segment %d", segment)
+
+	var (
+		lastEvaluatedKey = startKey
+		recordsRead      int64
+		throttleTicker   = time.NewTicker(s.throttle)
+		firstRequest     = true
+	)
+	defer throttleTicker.Stop()
+
+	boff := backoff.NewExponentialBackOff()
+	boff.InitialInterval = 200 * time.Millisecond
+	boff.MaxInterval = 5 * time.Second
+	boff.MaxElapsedTime = s.maxBackoff
+
+	for {
+		select {
+		case <-ctx.Done():
+			s.log.Debugf("Segment %d cancelled after %d records", segment, recordsRead)
+			return ctx.Err()
+		default:
+		}
+
+		if !firstRequest {
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-throttleTicker.C:
+			}
+		}
+		firstRequest = false
+
+		result, err := s.client.Scan(ctx, &dynamodb.ScanInput{
+			TableName:         aws.String(s.table),
+			Limit:             aws.Int32(int32(s.batchSize)),
+			Segment:           aws.Int32(int32(segment)),
+			TotalSegments:     aws.Int32(int32(s.segments)),
+			ExclusiveStartKey: lastEvaluatedKey,
+			ConsistentRead:    aws.Bool(false),
+		})
+		if err != nil {
+			if isThrottlingError(err) {
+				wait := boff.NextBackOff()
+				if wait == backoff.Stop {
+					return fmt.Errorf("scan throttle backoff exceeded max time for segment %d: %w", segment, err)
+				}
+				s.log.Warnf("Segment %d throttled, backing off for %v", segment, wait)
+				if err := smithytime.SleepWithContext(ctx, wait); err != nil {
+					return ctx.Err()
+				}
+				continue
+			}
+			return fmt.Errorf("scan failed for segment %d: %w", segment, err)
+		}
+		boff.Reset()
+
+		if len(result.Items) == 0 {
+			lastEvaluatedKey = result.LastEvaluatedKey
+			if lastEvaluatedKey == nil {
+				return s.completeSegment(ctx, segment, startTime, recordsRead)
+			}
+			continue
+		}
+
+		if err := s.onBatch(ctx, result.Items, segment, result.LastEvaluatedKey); err != nil {
+			return fmt.Errorf("processing batch for segment %d: %w", segment, err)
+		}
+		recordsRead += int64(len(result.Items))
+
+		if s.onProgress != nil {
+			s.onProgress(segment, s.segments, recordsRead)
+		}
+
+		lastEvaluatedKey = result.LastEvaluatedKey
+		if lastEvaluatedKey == nil {
+			return s.completeSegment(ctx, segment, startTime, recordsRead)
+		}
+	}
+}
+
+// completeSegment seals the segment (registering its ack-gated completion
+// marker), logs completion, and fires the metrics callback.
+func (s *SnapshotScanner) completeSegment(ctx context.Context, segment int, startTime time.Time, recordsRead int64) error {
+	if s.onSegmentSealed != nil {
+		if err := s.onSegmentSealed(ctx, segment); err != nil {
+			return fmt.Errorf("sealing segment %d: %w", segment, err)
+		}
+	}
+	duration := time.Since(startTime)
+	s.log.Infof("Segment %d completed: %d records read in %v", segment, recordsRead, duration)
+	if s.onSegmentComplete != nil {
+		s.onSegmentComplete(segment, duration, recordsRead)
+	}
+	return nil
+}
+
+// isThrottlingError checks if an error is due to AWS throttling.
+// It checks both dynamodb/types and dynamodbstreams/types variants because this
+// function is called from both the snapshot path (DynamoDB Scan API) and the CDC
+// path (DynamoDB Streams API), which return distinct concrete types.
+func isThrottlingError(err error) bool {
+	if err == nil {
+		return false
+	}
+	// DynamoDB table API types (snapshot scan path).
+	_, isLimit := errors.AsType[*dynamodbtypes.LimitExceededException](err)
+	_, isProvisioned := errors.AsType[*dynamodbtypes.ProvisionedThroughputExceededException](err)
+	// DynamoDB Streams API types (CDC reader path).
+	_, isStreamsLimit := errors.AsType[*streamstypes.LimitExceededException](err)
+	return isLimit || isProvisioned || isStreamsLimit
+}
+
+// isTrimmedDataAccessError returns true when a GetRecords call fails because the
+// shard iterator points past the oldest available stream record. This typically
+// happens when DynamoDB reorganises stream shards (e.g. after splits/merges or,
+// in DynamoDB Local, after the first write to an empty-stream shard). The caller
+// should obtain a fresh shard iterator and retry.
+func isTrimmedDataAccessError(err error) bool {
+	if err == nil {
+		return false
+	}
+	_, ok := errors.AsType[*streamstypes.TrimmedDataAccessException](err)
+	return ok
+}
+
+// isExpiredIteratorError returns true when a GetRecords call fails because the
+// shard iterator has expired. DynamoDB Streams iterators are only valid for 15
+// minutes, so a shard that is not read within that window (prolonged output
+// backpressure, a long idle period, or a stale iterator obtained just before a
+// restart) expires. The caller should obtain a fresh iterator from the last
+// processed position and retry rather than spinning on the dead iterator.
+func isExpiredIteratorError(err error) bool {
+	if err == nil {
+		return false
+	}
+	_, ok := errors.AsType[*streamstypes.ExpiredIteratorException](err)
+	return ok
+}
+
+// isIteratorThrottlingError reports whether a GetShardIterator failure is
+// throttling. The GetShardIterator operation models no throttling exception,
+// so AWS throttling codes reach the caller as generic API errors and are
+// matched by code (the SDK retryer's own throttle list) on top of the typed
+// checks in isThrottlingError.
+func isIteratorThrottlingError(err error) bool {
+	if isThrottlingError(err) {
+		return true
+	}
+	apiErr, ok := errors.AsType[smithy.APIError](err)
+	if !ok {
+		return false
+	}
+	_, throttled := retry.DefaultThrottleErrorCodes[apiErr.ErrorCode()]
+	return throttled
+}
+
+// isStreamsResourceNotFoundError returns true when a DynamoDB Streams call
+// fails because the requested stream or shard no longer exists. Unlike a
+// throttle or a network blip this is permanent: a deleted shard can never be
+// read again, so callers should hand it back to shard discovery rather than
+// retry. Deliberately matches only the Streams API type, not the DynamoDB
+// table API's ResourceNotFoundException (e.g. a missing checkpoint table).
+func isStreamsResourceNotFoundError(err error) bool {
+	if err == nil {
+		return false
+	}
+	_, ok := errors.AsType[*streamstypes.ResourceNotFoundException](err)
+	return ok
+}
+
+// SnapshotCheckpoint holds the progress of a snapshot scan.
+type SnapshotCheckpoint struct {
+	Complete        bool
+	SegmentProgress map[int]*SegmentState
+	// TotalSegments is the segment count the stored positions were scanned
+	// with, or zero when unknown (no progress, or rows written before the
+	// count was stored).
+	TotalSegments int
+	mu            sync.RWMutex
+}
+
+// SegmentState holds the state of a single scan segment.
+type SegmentState struct {
+	LastKey     map[string]dynamodbtypes.AttributeValue
+	RecordsRead int64
+	Complete    bool
+}
+
+// NewSnapshotCheckpoint creates a new snapshot checkpoint.
+func NewSnapshotCheckpoint() *SnapshotCheckpoint {
+	return &SnapshotCheckpoint{
+		Complete:        false,
+		SegmentProgress: make(map[int]*SegmentState),
+	}
+}
+
+// SegmentStartKey returns the starting key for a segment, or nil if starting from the beginning.
+func (c *SnapshotCheckpoint) SegmentStartKey(segment int) map[string]dynamodbtypes.AttributeValue {
+	if c == nil {
+		return nil
+	}
+
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+
+	if state, exists := c.SegmentProgress[segment]; exists && !state.Complete {
+		return state.LastKey
+	}
+	return nil
+}
+
+// ScanSegments returns the segment count a scan resuming from c must use.
+// A Scan segment's key range depends on the total segment count, so stored
+// positions are only valid under the count they were read with: when c
+// carries progress under another count than configured, the stored count
+// wins and resumed reports true. Otherwise it returns configured.
+func (c *SnapshotCheckpoint) ScanSegments(configured int) (segments int, resumed bool) {
+	if c == nil {
+		return configured, false
+	}
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	if c.Complete || len(c.SegmentProgress) == 0 || c.TotalSegments <= 0 || c.TotalSegments == configured {
+		return configured, false
+	}
+	return c.TotalSegments, true
+}
+
+// resolveSnapshotSegments returns the segment count for a scan resuming from
+// resume, warning when stored progress overrides the configured count.
+func resolveSnapshotSegments(resume *SnapshotCheckpoint, configured int, table string, log *service.Logger) int {
+	segments, resumed := resume.ScanSegments(configured)
+	if resumed {
+		log.Warnf("Resuming the snapshot of table %s with the %d segments its progress was stored under, not the configured snapshot_segments %d; the configured count applies to the next snapshot", table, segments, configured)
+	}
+	return segments
+}
+
+// SegmentComplete returns true if the given segment has already finished scanning.
+func (c *SnapshotCheckpoint) SegmentComplete(segment int) bool {
+	if c == nil {
+		return false
+	}
+
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+
+	if state, ok := c.SegmentProgress[segment]; ok {
+		return state.Complete
+	}
+	return false
+}
+
+// IsComplete returns true if the snapshot is complete.
+func (c *SnapshotCheckpoint) IsComplete() bool {
+	if c == nil {
+		return false
+	}
+
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.Complete
+}
+
+// MarkSegmentComplete marks a segment as complete.
+func (c *SnapshotCheckpoint) MarkSegmentComplete(segment int) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	if c.SegmentProgress[segment] == nil {
+		c.SegmentProgress[segment] = &SegmentState{}
+	}
+	c.SegmentProgress[segment].Complete = true
+}
+
+// MarkComplete marks the entire snapshot as complete.
+func (c *SnapshotCheckpoint) MarkComplete() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.Complete = true
+}

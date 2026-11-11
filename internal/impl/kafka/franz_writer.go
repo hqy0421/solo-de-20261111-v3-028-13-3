@@ -1,0 +1,755 @@
+// Copyright 2024 Redpanda Data, Inc.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//    http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package kafka
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"math"
+	"slices"
+	"strconv"
+	"sync"
+	"time"
+
+	"github.com/dustin/go-humanize"
+	"github.com/twmb/franz-go/pkg/kgo"
+
+	"github.com/redpanda-data/benthos/v4/public/service"
+
+	"github.com/redpanda-data/connect/v4/internal/dispatch"
+)
+
+const (
+	// Producer fields
+	kfwFieldPartitioner                = "partitioner"
+	kfwFieldIdempotentWrite            = "idempotent_write"
+	kfwFieldAcks                       = "acks"
+	kfwFieldCompression                = "compression"
+	kfwFieldAllowAutoTopicCreation     = "allow_auto_topic_creation"
+	kfwFieldTimeout                    = "timeout"
+	kfwFieldMaxMessageBytes            = "max_message_bytes"
+	kfwFieldBrokerWriteMaxBytes        = "broker_write_max_bytes"
+	kfwFieldMaxBufferedRecords         = "max_buffered_records"
+	kfwFieldMaxBufferedBytes           = "max_buffered_bytes"
+	kfwFieldMaxInFlightRequestsPerBrkr = "max_in_flight_requests"
+	kfwFieldRecordRetries              = "record_retries"
+	kfwFieldRecordDeliveryTimeout      = "record_delivery_timeout"
+)
+
+// FranzProducerLimitsFields returns a slice of fields specifically for
+// customising producer limits via the franz-go library.
+func FranzProducerLimitsFields() []*service.ConfigField {
+	return []*service.ConfigField{
+		service.NewDurationField(kfwFieldTimeout).
+			Description(kafkaOutputTimeoutDescription).Version("4.3.0").
+			Default("10s").
+			Advanced(),
+		service.NewStringField(kfwFieldMaxMessageBytes).
+			Description("The maximum size of a produced record batch in bytes. " +
+				"A `MESSAGE_TOO_LARGE` error is returned if a batch exceeds this limit. " +
+				"This field maps to the `max.message.bytes` Kafka property. " +
+				"Ensure the Redpanda broker's xref:streaming:reference:properties/cluster-properties.adoc#kafka_batch_max_bytes[`kafka_batch_max_bytes`] property is at least as large as this value.").
+			ShortDescription("Maximum size of a produced record batch. Maps to the Kafka max.message.bytes property.").
+			Advanced().
+			Default("1MiB").
+			Example("100MB").
+			Example("50mib"),
+		service.NewStringField(kfwFieldBrokerWriteMaxBytes).
+			Description("The maximum number of bytes this output can write to a broker connection in a single write. This field corresponds to Kafka's `socket.request.max.bytes`.").Version("4.35.0").
+			ShortDescription("Upper bound on bytes written to a broker connection in a single write.").
+			Advanced().
+			Default("100MiB").
+			Example("128MB").
+			Example("50mib"),
+		service.NewIntField(kfwFieldMaxBufferedRecords).
+			Description("The maximum number of records the client will buffer in memory before blocking. " +
+				"When this limit is reached, `Produce()` calls will block until buffered records are delivered and space frees up. " +
+				"Increase this value for high-throughput pipelines to avoid back-pressure stalls.").Version("4.92.0").
+			ShortDescription("Maximum records buffered in memory before producing blocks.").
+			Advanced().
+			Default(10000),
+		service.NewStringField(kfwFieldMaxBufferedBytes).
+			Description("The maximum number of bytes the client will buffer in memory before blocking. " +
+				"When this limit is reached, `Produce()` calls will block until buffered records are delivered. " +
+				"Set to `0` to disable the byte-level limit (only `max_buffered_records` applies). " +
+				"This limit is checked after `max_buffered_records`.").Version("4.92.0").
+			ShortDescription("Maximum bytes buffered in memory before producing blocks. Set to 0 to disable the byte limit.").
+			Advanced().
+			Default("0").
+			Example("256MB").
+			Example("50mib"),
+		service.NewIntField(kfwFieldMaxInFlightRequestsPerBrkr).
+			Description("The maximum number of produce requests in flight per broker connection. " +
+				"While `idempotent_write` is enabled (the default) this must be `1`, as the client relies on a single in-flight request per broker to guarantee ordering. " +
+				"To use higher values you must set `idempotent_write` to `false`, which allows requests to be pipelined for throughput but may cause duplicate and out-of-order delivery on retries. " +
+				"Note that this is distinct from the output's `max_in_flight` field, which counts message batches being written in parallel rather than produce requests on the wire. " +
+				"A value of `1` is not a throughput ceiling: records from concurrent writes are coalesced into fewer, larger produce requests.").Version("4.92.0").
+			ShortDescription("Maximum produce requests in flight per broker connection. Must be 1 while idempotent_write is enabled.").
+			Advanced().
+			Default(1),
+		service.NewIntField(kfwFieldRecordRetries).
+			Description("The maximum number of times a record produce is retried on failure before the record is failed. " +
+				"When a record fails, all records buffered in the same partition are also failed to preserve gapless ordering. " +
+				"Set to `0` for unlimited retries (the default). " +
+				"With `idempotent_write` enabled, retries are only enforced when safe to do so without creating invalid sequence numbers.").Version("4.92.0").
+			ShortDescription("Maximum number of times a record produce is retried before the record fails.").
+			Advanced().
+			Default(0),
+		service.NewDurationField(kfwFieldRecordDeliveryTimeout).
+			Description("The maximum time a record can sit in the producer buffer before it is failed, roughly equivalent to Kafka's `delivery.timeout.ms`. " +
+				"This is evaluated before writing a request or after a produce response. " +
+				"When a record times out, all records in the same partition are also failed. " +
+				"Set to `0s` for no timeout (the default). " +
+				"With `idempotent_write` enabled, timeouts are only enforced when safe to do so without creating invalid sequence numbers.").Version("4.92.0").
+			ShortDescription("Maximum time a record may sit in the producer buffer before failing. Equivalent to Kafka's delivery.timeout.ms.").
+			Advanced().
+			Default("0s"),
+	}
+}
+
+// FranzProducerFields returns a slice of fields specifically for customising
+// producer behaviour via the franz-go library.
+func FranzProducerFields() []*service.ConfigField {
+	return slices.Concat(
+		[]*service.ConfigField{
+			service.NewStringAnnotatedEnumField(kfwFieldPartitioner, map[string]string{
+				"murmur2_hash": "Kafka's default hash algorithm that uses a 32-bit murmur2 hash of the key to compute which partition the record will be on.",
+				"round_robin":  "Round-robin's messages through all available partitions. This algorithm has lower throughput and causes higher CPU load on brokers, but can be useful if you want to ensure an even distribution of records to partitions.",
+				"least_backup": "Chooses the least backed up partition (the partition with the fewest amount of buffered records). Partitions are selected per batch.",
+				"manual":       "Manually select a partition for each message, requires the field `partition` to be specified.",
+			}).
+				Description("Override the default murmur2 hashing partitioner.").
+				Advanced().Optional(),
+			service.NewBoolField(kfwFieldIdempotentWrite).
+				Description("Enable the idempotent write producer option. When enabled, the producer initializes a producer ID and uses it to guarantee exactly-once semantics per partition, so retries do not produce duplicates. This option requires the `IDEMPOTENT_WRITE` permission on the `CLUSTER` resource. Disable this option if the `IDEMPOTENT_WRITE` permission is unavailable, for example in some managed Kafka services or Redpanda clusters with strict ACLs. Disabling this option only affects retry behavior: duplicates may occur on producer retries, but the pipeline continues to function normally.").Version("4.24.0").
+				ShortDescription("Enable the idempotent write producer option for exactly-once semantics per partition. Requires the IDEMPOTENT_WRITE permission on CLUSTER.").
+				Default(true).
+				Advanced(),
+			service.NewStringAnnotatedEnumField(kfwFieldAcks, map[string]string{
+				"all":    "Wait for all in-sync replicas to acknowledge (acks=-1). Required when idempotent_write is enabled.",
+				"none":   "Do not wait for any acknowledgement (acks=0). Highest throughput but messages may be lost.",
+				"leader": "Wait for the leader broker to acknowledge (acks=1). Messages are lost if the leader fails before replication.",
+			}).
+				Description("The number of acknowledgements the leader broker must receive from ISR brokers before responding to the produce request. " +
+					"When `idempotent_write` is enabled this must be set to `all`.").Version("4.92.0").
+				ShortDescription("Acknowledgements the leader must receive from ISR brokers before responding. Must be all when idempotent_write is enabled.").
+				Default("all").
+				Advanced(),
+			service.NewStringEnumField(kfwFieldCompression, "lz4", "snappy", "gzip", "none", "zstd").
+				Description("The compression codec for produced record batches. A batch that compression does not make smaller is sent uncompressed, whichever codec you choose.").
+				ShortDescription("Compression codec for produced record batches. A batch that compression does not shrink is sent uncompressed.").
+				Default("snappy").
+				Advanced(),
+			service.NewBoolField(kfwFieldAllowAutoTopicCreation).
+				Description("Enables topics to be auto created if they do not exist when fetching their metadata. If set to `false`, the topic must already exist.").Version("4.58.0").
+				Default(true).
+				Advanced(),
+		},
+		FranzProducerLimitsFields(),
+	)
+}
+
+// FranzProducerLimitsOptsFromConfig returns a slice of franz-go client opts for
+// customising producer limits from a parsed config.
+func FranzProducerLimitsOptsFromConfig(conf *service.ParsedConfig) ([]kgo.Opt, error) {
+	var opts []kgo.Opt
+
+	maxMessageBytesStr, err := conf.FieldString(kfwFieldMaxMessageBytes)
+	if err != nil {
+		return nil, err
+	}
+	maxMessageBytes, err := humanize.ParseBytes(maxMessageBytesStr)
+	if err != nil {
+		return nil, fmt.Errorf("parsing max_message_bytes: %w", err)
+	}
+	if maxMessageBytes > uint64(math.MaxInt32) {
+		return nil, fmt.Errorf("invalid max_message_bytes, must not exceed %v", math.MaxInt32)
+	}
+	opts = append(opts, kgo.ProducerBatchMaxBytes(int32(maxMessageBytes)))
+
+	brokerWriteMaxBytesStr, err := conf.FieldString(kfwFieldBrokerWriteMaxBytes)
+	if err != nil {
+		return nil, err
+	}
+	brokerWriteMaxBytes, err := humanize.ParseBytes(brokerWriteMaxBytesStr)
+	if err != nil {
+		return nil, fmt.Errorf("parsing broker_write_max_bytes: %w", err)
+	}
+	if brokerWriteMaxBytes > 1<<30 {
+		return nil, fmt.Errorf("invalid broker_write_max_bytes, must not exceed %v", 1<<30)
+	}
+	opts = append(opts, kgo.BrokerMaxWriteBytes(int32(brokerWriteMaxBytes)))
+
+	timeout, err := conf.FieldDuration(kfwFieldTimeout)
+	if err != nil {
+		return nil, err
+	}
+	opts = append(opts, kgo.ProduceRequestTimeout(timeout))
+
+	maxBufferedRecords, err := conf.FieldInt(kfwFieldMaxBufferedRecords)
+	if err != nil {
+		return nil, err
+	}
+	if maxBufferedRecords < 1 {
+		return nil, fmt.Errorf("invalid max_buffered_records %d, must be at least 1", maxBufferedRecords)
+	}
+	opts = append(opts, kgo.MaxBufferedRecords(maxBufferedRecords))
+
+	maxBufferedBytesStr, err := conf.FieldString(kfwFieldMaxBufferedBytes)
+	if err != nil {
+		return nil, err
+	}
+	var maxBufferedBytes uint64
+	maxBufferedBytes, err = humanize.ParseBytes(maxBufferedBytesStr)
+	if err != nil {
+		return nil, fmt.Errorf("parsing max_buffered_bytes: %w", err)
+	}
+	if maxBufferedBytes > uint64(math.MaxInt) {
+		return nil, fmt.Errorf("invalid max_buffered_bytes, must not exceed %v", math.MaxInt)
+	}
+	if maxBufferedBytes > 0 {
+		opts = append(opts, kgo.MaxBufferedBytes(int(maxBufferedBytes)))
+	}
+
+	maxInFlightRequests, err := conf.FieldInt(kfwFieldMaxInFlightRequestsPerBrkr)
+	if err != nil {
+		return nil, err
+	}
+	if maxInFlightRequests < 1 {
+		return nil, fmt.Errorf("invalid max_in_flight_requests %d, must be at least 1", maxInFlightRequests)
+	}
+	opts = append(opts, kgo.MaxProduceRequestsInflightPerBroker(maxInFlightRequests))
+
+	recordRetries, err := conf.FieldInt(kfwFieldRecordRetries)
+	if err != nil {
+		return nil, err
+	}
+	if recordRetries > 0 {
+		opts = append(opts, kgo.RecordRetries(recordRetries))
+	}
+
+	recordDeliveryTimeout, err := conf.FieldDuration(kfwFieldRecordDeliveryTimeout)
+	if err != nil {
+		return nil, err
+	}
+	if recordDeliveryTimeout > 0 {
+		opts = append(opts, kgo.RecordDeliveryTimeout(recordDeliveryTimeout))
+	}
+
+	return opts, nil
+}
+
+// FranzProducerOptsFromConfig returns a slice of franz-go client opts from a
+// parsed config.
+func FranzProducerOptsFromConfig(conf *service.ParsedConfig) ([]kgo.Opt, error) {
+	var opts []kgo.Opt
+	var err error
+	if opts, err = FranzProducerLimitsOptsFromConfig(conf); err != nil {
+		return nil, err
+	}
+
+	var compressionPrefs []kgo.CompressionCodec
+	if conf.Contains(kfwFieldCompression) {
+		cStr, err := conf.FieldString(kfwFieldCompression)
+		if err != nil {
+			return nil, err
+		}
+
+		switch cStr {
+		case "lz4":
+			compressionPrefs = append(compressionPrefs, kgo.Lz4Compression())
+		case "gzip":
+			compressionPrefs = append(compressionPrefs, kgo.GzipCompression())
+		case "snappy":
+			// The same preference list as the franz-go default, which the
+			// default value of this field stands for.
+			compressionPrefs = append(compressionPrefs, kgo.SnappyCompression(), kgo.NoCompression())
+		case "zstd":
+			compressionPrefs = append(compressionPrefs, kgo.ZstdCompression())
+		case "none":
+			compressionPrefs = append(compressionPrefs, kgo.NoCompression())
+		default:
+			return nil, fmt.Errorf("compression codec %v not recognised", cStr)
+		}
+	}
+	if len(compressionPrefs) > 0 {
+		opts = append(opts, kgo.ProducerBatchCompression(compressionPrefs...))
+	}
+
+	partitioner := kgo.StickyKeyPartitioner(nil)
+	if conf.Contains(kfwFieldPartitioner) {
+		partStr, err := conf.FieldString(kfwFieldPartitioner)
+		if err != nil {
+			return nil, err
+		}
+		switch partStr {
+		case "murmur2_hash":
+			partitioner = kgo.StickyKeyPartitioner(nil)
+		case "round_robin":
+			partitioner = kgo.RoundRobinPartitioner()
+		case "least_backup":
+			partitioner = kgo.LeastBackupPartitioner()
+		case "manual":
+			partitioner = kgo.ManualPartitioner()
+		default:
+			return nil, fmt.Errorf("unknown partitioner: %v", partStr)
+		}
+	}
+	if partitioner != nil {
+		opts = append(opts, kgo.RecordPartitioner(partitioner))
+	}
+
+	idempotentWrite, err := conf.FieldBool(kfwFieldIdempotentWrite)
+	if err != nil {
+		return nil, err
+	}
+
+	acksStr, err := conf.FieldString(kfwFieldAcks)
+	if err != nil {
+		return nil, err
+	}
+
+	if idempotentWrite && acksStr != "all" {
+		return nil, fmt.Errorf("idempotent_write requires acks to be \"all\", got %q", acksStr)
+	}
+
+	// The franz-go client rejects any value other than 1 here while idempotency
+	// is enabled, because it relies on a single in-flight request per broker to
+	// keep producer sequence numbers gapless. Without this check that rejection
+	// surfaces from within Connect() as a retryable connection error, so the
+	// pipeline starts, retries forever and silently produces nothing.
+	maxInFlightRequests, err := conf.FieldInt(kfwFieldMaxInFlightRequestsPerBrkr)
+	if err != nil {
+		return nil, err
+	}
+	if idempotentWrite && maxInFlightRequests != 1 {
+		return nil, fmt.Errorf("idempotent_write requires max_in_flight_requests to be 1, got %d (set idempotent_write to false to use higher values, at the cost of possible duplicate and out-of-order delivery on retries)", maxInFlightRequests)
+	}
+
+	if !idempotentWrite {
+		opts = append(opts, kgo.DisableIdempotentWrite())
+	}
+
+	switch acksStr {
+	case "all":
+		opts = append(opts, kgo.RequiredAcks(kgo.AllISRAcks()))
+	case "leader":
+		opts = append(opts, kgo.RequiredAcks(kgo.LeaderAck()))
+	case "none":
+		opts = append(opts, kgo.RequiredAcks(kgo.NoAck()))
+	default:
+		return nil, fmt.Errorf("unknown acks value: %q", acksStr)
+	}
+
+	allowAutoTopicCreation, err := conf.FieldBool(kfwFieldAllowAutoTopicCreation)
+	if err != nil {
+		return nil, err
+	}
+
+	if allowAutoTopicCreation {
+		opts = append(opts, kgo.AllowAutoTopicCreation())
+	}
+
+	return opts, nil
+}
+
+//------------------------------------------------------------------------------
+
+const (
+	kfwFieldTopic       = "topic"
+	kfwFieldKey         = "key"
+	kfwFieldPartition   = "partition"
+	kfwFieldMetadata    = "metadata"
+	kfwFieldTimestamp   = "timestamp"
+	kfwFieldTimestampMs = "timestamp_ms"
+	kfwFieldTombstone   = "tombstone"
+)
+
+// Descriptions shared by the fields of the franz-go and Sarama based Kafka
+// outputs.
+const (
+	kafkaOutputKeyDescription         = "An optional key to populate for each message."
+	kafkaOutputTimeoutDescription     = "The maximum period of time to wait for message sends before abandoning the request and retrying."
+	kafkaOutputTimestampDescription   = "An optional timestamp to set for each message, in seconds since the Unix epoch. When left empty, the current timestamp is used."
+	kafkaOutputTimestampMsDescription = "An optional timestamp to set for each message, in milliseconds since the Unix epoch. When left empty, the current timestamp is used. You cannot set both `timestamp` and `timestamp_ms`."
+)
+
+// FranzWriterConfigFields returns a slice of config fields specifically for
+// customising data written to a Kafka broker.
+func FranzWriterConfigFields() []*service.ConfigField {
+	return []*service.ConfigField{
+		service.NewInterpolatedStringField(kfwFieldTopic).
+			Description("A topic to write messages to."),
+		service.NewInterpolatedStringField(kfwFieldKey).
+			Description(kafkaOutputKeyDescription).Optional(),
+		service.NewInterpolatedStringField(kfwFieldPartition).
+			Description("An optional explicit partition to set for each message. This field is only relevant when the `partitioner` is set to `manual`. The provided interpolation string must be a valid integer.").Version("4.13.0").
+			ShortDescription("An explicit partition for each message. Only relevant when partitioner is set to manual.").
+			Example(`${! meta("partition") }`).
+			Optional(),
+		service.NewMetadataFilterField(kfwFieldMetadata).
+			Description("Determines which metadata values are added to messages as headers.").
+			Optional(),
+		service.NewInterpolatedStringField(kfwFieldTimestamp).
+			Description(kafkaOutputTimestampDescription).
+			Example(`${! timestamp_unix() }`).
+			Example(`${! metadata("kafka_timestamp_unix") }`).
+			Optional().
+			Advanced().
+			Deprecated(),
+		service.NewInterpolatedStringField(kfwFieldTimestampMs).
+			Description(kafkaOutputTimestampMsDescription).Version("4.40.0").
+			Example(`${! timestamp_unix_milli() }`).
+			Example(`${! metadata("kafka_timestamp_ms") }`).
+			Optional().
+			Advanced(),
+		service.NewInterpolatedStringField(kfwFieldTombstone).
+			Description("An optional boolean that, when it resolves to `true` for a message, writes that message as a tombstone: a record with a null value. The message payload is ignored for tombstones. Use this to delete keys on compacted topics, or to keep tombstones intact when mirroring a topic. An empty payload is not a tombstone. The interpolation must resolve to a value that can be parsed as a boolean, otherwise the write fails.").
+			Version("4.114.0").
+			Example(`${! @kafka_tombstone_message }`).
+			Example(`${! @operation == "delete" }`).
+			Optional().
+			Advanced(),
+	}
+}
+
+// FranzWriterConfigLints returns the linter rules for a the writer config.
+func FranzWriterConfigLints() string {
+	return `root = match {
+  this.partitioner == "manual" && this.partition.or("") == "" => "a partition must be specified when the partitioner is set to manual"
+  this.partitioner != "manual" && this.partition.or("") != "" => "a partition cannot be specified unless the partitioner is set to manual"
+  this.timestamp.or("") != "" && this.timestamp_ms.or("") != "" => "both timestamp and timestamp_ms cannot be specified simultaneously"
+  this.idempotent_write.or(true) == true && this.acks.or("all") != "all" => "idempotent_write requires acks to be set to all"
+  this.idempotent_write.or(true) == true && this.max_in_flight_requests.or(1) != 1 => "idempotent_write requires max_in_flight_requests to be 1, set idempotent_write to false to use higher values"
+}`
+}
+
+type franzWriterHooks struct {
+	accessClientFn func(context.Context, FranzSharedClientUseFn) error
+	yieldClientFn  func(context.Context) error
+}
+
+// NewFranzWriterHooks creates a new franzWriterHooks instance with a hook function that's executed to fetch the client.
+func NewFranzWriterHooks(fn func(context.Context, FranzSharedClientUseFn) error) franzWriterHooks {
+	return franzWriterHooks{accessClientFn: fn}
+}
+
+// WithYieldClientFn adds a hook function that's executed during close to yield the client.
+func (h franzWriterHooks) WithYieldClientFn(fn func(context.Context) error) franzWriterHooks {
+	h.yieldClientFn = fn
+	return h
+}
+
+// FranzWriter implements a Kafka writer using the franz-go library.
+type FranzWriter struct {
+	Topic         *service.InterpolatedString
+	Key           *service.InterpolatedString
+	Partition     *service.InterpolatedString
+	Timestamp     *service.InterpolatedString
+	IsTimestampMs bool
+	Tombstone     *service.InterpolatedString
+	MetaFilter    *service.MetadataFilter
+	hooks         franzWriterHooks
+
+	// MessageBatchToFranzRecords is a custom batch record constructor for
+	// specialized cases like migrator.
+	//
+	// Contract:
+	// - Must return exactly one record per input message (same slice length)
+	// - Use SkipRecord sentinel value for messages that should not be written
+	// - Returned records are validated for count match before processing
+	//
+	// When nil, the default messageBatchToFranzRecords implementation is used.
+	MessageBatchToFranzRecords func(batch service.MessageBatch) ([]kgo.Record, error)
+
+	// DecorateRecord is executed for each record before it is written to the
+	// broker.
+	//
+	// Deprecated: Use [MessageBatchToFranzRecords] instead.
+	DecorateRecord func(r *kgo.Record) error
+}
+
+// NewFranzWriterFromConfig uses a parsed config to extract customisation for writing data to a Kafka broker. A closure
+// function must be provided that is responsible for granting access to a connected client.
+func NewFranzWriterFromConfig(conf *service.ParsedConfig, hooks franzWriterHooks) (*FranzWriter, error) {
+	w := FranzWriter{
+		hooks: hooks,
+	}
+
+	var err error
+	if w.Topic, err = conf.FieldInterpolatedString(kfwFieldTopic); err != nil {
+		return nil, err
+	}
+
+	if conf.Contains(kfwFieldKey) {
+		if w.Key, err = conf.FieldInterpolatedString(kfwFieldKey); err != nil {
+			return nil, err
+		}
+	}
+
+	if rawStr, _ := conf.FieldString(kfwFieldPartition); rawStr != "" {
+		if w.Partition, err = conf.FieldInterpolatedString(kfwFieldPartition); err != nil {
+			return nil, err
+		}
+	}
+
+	if conf.Contains(kfwFieldMetadata) {
+		if w.MetaFilter, err = conf.FieldMetadataFilter(kfwFieldMetadata); err != nil {
+			return nil, err
+		}
+	}
+
+	if conf.Contains(kfwFieldTimestamp) && conf.Contains(kfwFieldTimestampMs) {
+		return nil, errors.New("cannot specify both timestamp and timestamp_ms fields")
+	}
+
+	if conf.Contains(kfwFieldTimestamp) {
+		if w.Timestamp, err = conf.FieldInterpolatedString(kfwFieldTimestamp); err != nil {
+			return nil, err
+		}
+	}
+
+	if conf.Contains(kfwFieldTimestampMs) {
+		if w.Timestamp, err = conf.FieldInterpolatedString(kfwFieldTimestampMs); err != nil {
+			return nil, err
+		}
+		w.IsTimestampMs = true
+	}
+
+	if conf.Contains(kfwFieldTombstone) {
+		if w.Tombstone, err = conf.FieldInterpolatedString(kfwFieldTombstone); err != nil {
+			return nil, err
+		}
+	}
+
+	return &w, nil
+}
+
+//------------------------------------------------------------------------------
+
+// SkipRecord is a sentinel value that can be returned by custom
+// MessageBatchToFranzRecords implementations to indicate a record should be
+// skipped and not written to Kafka.
+var SkipRecord = kgo.Record{}
+
+// messageBatchToFranzRecords is the default implementation that converts
+// messages to records using configured interpolation and metadata filters.
+func (w *FranzWriter) messageBatchToFranzRecords(batch service.MessageBatch) ([]kgo.Record, error) {
+	records := make([]kgo.Record, 0, len(batch))
+
+	for _, msg := range batch {
+		r := kgo.Record{
+			Context: msg.Context(),
+		}
+
+		var err error
+
+		// Optional: Tombstone
+		var tombstone bool
+		if w.Tombstone != nil {
+			tsStr, err := w.Tombstone.TryString(msg)
+			if err != nil {
+				return nil, fmt.Errorf("tombstone interpolation: %w", err)
+			}
+			if tombstone, err = strconv.ParseBool(tsStr); err != nil {
+				return nil, fmt.Errorf("parse tombstone: %w", err)
+			}
+		}
+
+		// Required: Value, left nil for tombstones so it is encoded as null.
+		if !tombstone {
+			r.Value, err = msg.AsBytes()
+			if err != nil {
+				return nil, fmt.Errorf("message to bytes: %w", err)
+			}
+		}
+
+		// Required: Topic
+		r.Topic, err = w.Topic.TryString(msg)
+		if err != nil {
+			return nil, fmt.Errorf("topic interpolation: %w", err)
+		}
+
+		// Optional: Key
+		if w.Key != nil {
+			r.Key, err = w.Key.TryBytes(msg)
+			if err != nil {
+				return nil, fmt.Errorf("key interpolation: %w", err)
+			}
+		}
+
+		// Optional: Headers
+		if w.MetaFilter != nil {
+			_ = w.MetaFilter.Walk(msg, func(key, value string) error {
+				r.Headers = append(r.Headers, kgo.RecordHeader{
+					Key:   key,
+					Value: []byte(value),
+				})
+				return nil
+			})
+		}
+
+		// Optional: Timestamp
+		if w.Timestamp != nil {
+			tsStr, err := w.Timestamp.TryString(msg)
+			if err != nil {
+				return nil, fmt.Errorf("timestamp interpolation: %w", err)
+			}
+
+			ts, err := strconv.ParseInt(tsStr, 10, 64)
+			if err != nil {
+				return nil, fmt.Errorf("parse timestamp: %w", err)
+			}
+
+			if w.IsTimestampMs {
+				r.Timestamp = time.UnixMilli(ts)
+			} else {
+				r.Timestamp = time.Unix(ts, 0)
+			}
+		}
+
+		// Optional: Partition
+		if w.Partition != nil {
+			partStr, err := w.Partition.TryString(msg)
+			if err != nil {
+				return nil, fmt.Errorf("partition interpolation: %w", err)
+			}
+			partInt, err := strconv.ParseInt(partStr, 10, 32)
+			if err != nil {
+				return nil, fmt.Errorf("parse partition: %w", err)
+			}
+			r.Partition = int32(partInt)
+		}
+
+		records = append(records, r)
+	}
+
+	return records, nil
+}
+
+// ConnectionTest attempts to test the connection configuration of this output
+// without actually consuming data. The connection, if successful, is then
+// closed.
+func (w *FranzWriter) ConnectionTest(ctx context.Context) service.ConnectionTestResults {
+	if err := w.hooks.accessClientFn(ctx, func(details *FranzSharedClientInfo) error {
+		return details.Client.Ping(ctx)
+	}); err != nil {
+		return service.ConnectionTestFailed(err).AsList()
+	}
+
+	if err := w.hooks.yieldClientFn(ctx); err != nil {
+		return service.ConnectionTestFailed(err).AsList()
+	}
+
+	return service.ConnectionTestSucceeded().AsList()
+}
+
+// Connect to the target seed brokers.
+func (w *FranzWriter) Connect(ctx context.Context) error {
+	return w.hooks.accessClientFn(ctx, func(_ *FranzSharedClientInfo) error {
+		// Simply accessing the client is enough to establish that it is
+		// successfully connected.
+		return nil
+	})
+}
+
+// WriteBatch attempts to write a batch of messages to the target topics.
+func (w *FranzWriter) WriteBatch(ctx context.Context, b service.MessageBatch) error {
+	if len(b) == 0 {
+		return nil
+	}
+	return w.hooks.accessClientFn(ctx, w.newBatchWriter(ctx, b).writeBatch)
+}
+
+// batchWriter handles concurrent writes of a message batch to Kafka.
+type batchWriter struct {
+	*FranzWriter
+	ctx   context.Context //nolint:containedctx // method-scoped context captured for batch callback
+	batch service.MessageBatch
+}
+
+func (w *FranzWriter) newBatchWriter(ctx context.Context, batch service.MessageBatch) *batchWriter {
+	return &batchWriter{
+		FranzWriter: w,
+		ctx:         ctx,
+		batch:       batch,
+	}
+}
+
+func (w *batchWriter) writeBatch(details *FranzSharedClientInfo) error {
+	conv := w.MessageBatchToFranzRecords
+	if conv == nil {
+		conv = w.messageBatchToFranzRecords
+	}
+	records, err := conv(w.batch)
+	if err != nil {
+		return fmt.Errorf("creating records: %w", err)
+	}
+	if len(records) != len(w.batch) {
+		return fmt.Errorf("record count mismatch: got %d records for %d messages", len(records), len(w.batch))
+	}
+	// produceErrs is appended to only from produce promises, which franz-go
+	// guarantees to invoke serially (never concurrently with each other), and
+	// is read only after wg.Wait, which orders the read after the last
+	// promise. decorateErrs is appended to only from this goroutine. Keeping
+	// them apart avoids a concurrent append between the two.
+	var produceErrs, decorateErrs []error
+	var wg sync.WaitGroup
+	for i := range records {
+		r := &records[i]
+
+		// Skip records that match the SkipRecord sentinel
+		if r.Topic == "" && r.Value == nil && r.Key == nil {
+			dispatch.TriggerSignal(w.batch[i].Context())
+			continue
+		}
+
+		if r.Context == nil {
+			r.Context = w.ctx
+		}
+		if w.DecorateRecord != nil {
+			if err := w.DecorateRecord(r); err != nil {
+				// No dispatch signal here: the record was never handed to the
+				// producer and the batch is about to fail, so an ordered input
+				// must keep holding the partition until the nack resolves.
+				decorateErrs = append(decorateErrs, fmt.Errorf("decorate record: %w", err))
+				continue
+			}
+		}
+
+		wg.Add(1)
+		details.Client.Produce(w.ctx, r, func(_ *kgo.Record, err error) {
+			produceErrs = append(produceErrs, err)
+			wg.Done()
+		})
+		// The record is now owned by the producer client, so signal dispatch
+		// here rather than from the produce callback: paired ordered inputs use
+		// this signal to release the next batch for the partition before the
+		// broker acknowledges this one.
+		dispatch.TriggerSignal(w.batch[i].Context())
+	}
+	wg.Wait()
+	return errors.Join(slices.Compact(append(decorateErrs, produceErrs...))...)
+}
+
+// Close calls into the provided yield client func.
+func (w *FranzWriter) Close(ctx context.Context) error {
+	if w.hooks.yieldClientFn != nil {
+		return w.hooks.yieldClientFn(ctx)
+	}
+
+	return nil
+}

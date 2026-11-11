@@ -1,0 +1,697 @@
+// Copyright 2026 Redpanda Data, Inc.
+//
+// Licensed as a Redpanda Enterprise file under the Redpanda Community
+// License (the "License"); you may not use this file except in compliance with
+// the License. You may obtain a copy of the License at
+//
+// https://github.com/redpanda-data/redpanda/blob/master/licenses/rcl.md
+
+package iceberg
+
+import (
+	"context"
+	"fmt"
+	"net/url"
+	"time"
+
+	"github.com/apache/iceberg-go"
+	"github.com/apache/iceberg-go/io"
+	_ "github.com/apache/iceberg-go/io/gocloud"
+	"github.com/parquet-go/parquet-go"
+
+	"github.com/redpanda-data/benthos/v4/public/service"
+
+	baws "github.com/redpanda-data/connect/v4/internal/impl/aws"
+	"github.com/redpanda-data/connect/v4/internal/impl/iceberg/catalogx"
+	"github.com/redpanda-data/connect/v4/internal/license"
+)
+
+func init() {
+	service.MustRegisterBatchOutput(
+		"iceberg",
+		icebergOutputConfig(),
+		func(conf *service.ParsedConfig, mgr *service.Resources) (
+			output service.BatchOutput,
+			batchPolicy service.BatchPolicy,
+			maxInFlight int,
+			err error,
+		) {
+			// Check enterprise license
+			if err = license.CheckRunningEnterprise(mgr); err != nil {
+				return
+			}
+
+			// Parse configuration
+			output, err = newIcebergOutputFromConfig(conf, mgr)
+			if err != nil {
+				return
+			}
+
+			// Get batch policy
+			if batchPolicy, err = conf.FieldBatchPolicy(ioFieldBatching); err != nil {
+				return
+			}
+
+			// Get max in flight
+			if maxInFlight, err = conf.FieldInt(ioFieldMaxInFlight); err != nil {
+				return
+			}
+
+			return
+		})
+}
+
+// icebergOutput implements service.BatchOutput for Iceberg tables.
+type icebergOutput struct {
+	router *Router
+	logger *service.Logger
+}
+
+// opMetrics holds counters for row-level operations and commit health. Row
+// operations share a single counter labelled by operation (insert/upsert/
+// delete), following the Prometheus convention of one metric with a label
+// rather than one metric per verb, so they aggregate cleanly. The holder is nil
+// in tests that construct writers/committers directly; the incr* methods are
+// nil-safe so callers need not check.
+type opMetrics struct {
+	rowOps         *service.MetricCounter // labelled by "operation"
+	commitFailures *service.MetricCounter
+}
+
+func newOpMetrics(m *service.Metrics) *opMetrics {
+	return &opMetrics{
+		rowOps:         m.NewCounter("iceberg_row_operations_total", "operation"),
+		commitFailures: m.NewCounter("iceberg_commit_failures_total"),
+	}
+}
+
+// NOTE: there is no importable seam here to assert emitted
+// counter *values* in a unit test. service.MockResources() backs its Metrics
+// with metrics.Noop() (which discards writes), and the only readable in-memory
+// implementation (metrics.NewLocal) lives in benthos-internal
+// internal/component/metrics, which a different module cannot import; nor is
+// there a public constructor for *service.Metrics that accepts a recording
+// MetricsExporter. Reading a value would therefore require either putting
+// opMetrics behind an interface (the refactor deliberately avoided) or standing
+// up a full stream + Prometheus scrape (disproportionate). Instead the row-count
+// values that feed rowOps are pinned by TestSplitByOperationCOWCountsFeedMetrics
+// on the writer side; the incr* label wiring is covered by the incr* methods'
+// own trivial mapping. Revisit if benthos exposes a public readable metrics mock.
+
+func (m *opMetrics) incrInserted(n int64) {
+	if m != nil && n > 0 {
+		m.rowOps.Incr(n, "insert")
+	}
+}
+
+func (m *opMetrics) incrUpserted(n int64) {
+	if m != nil && n > 0 {
+		m.rowOps.Incr(n, "upsert")
+	}
+}
+
+func (m *opMetrics) incrDeleted(n int64) {
+	if m != nil && n > 0 {
+		m.rowOps.Incr(n, "delete")
+	}
+}
+
+func (m *opMetrics) incrCommitFailure() {
+	if m != nil {
+		m.commitFailures.Incr(1)
+	}
+}
+
+// newIcebergOutputFromConfig creates a new Iceberg output from parsed configuration.
+func newIcebergOutputFromConfig(conf *service.ParsedConfig, mgr *service.Resources) (*icebergOutput, error) {
+	// Parse catalog configuration
+	catalogCfg, err := parseCatalogConfig(conf)
+	if err != nil {
+		return nil, fmt.Errorf("parsing catalog config: %w", err)
+	}
+
+	// Parse table identification
+	namespaceStr, err := conf.FieldInterpolatedString(ioFieldNamespace)
+	if err != nil {
+		return nil, fmt.Errorf("parsing namespace: %w", err)
+	}
+
+	tableStr, err := conf.FieldInterpolatedString(ioFieldTable)
+	if err != nil {
+		return nil, fmt.Errorf("parsing table name: %w", err)
+	}
+
+	caseSensitive, err := conf.FieldBool(ioFieldCaseSensitiveColumns)
+	if err != nil {
+		return nil, fmt.Errorf("parsing %s: %w", ioFieldCaseSensitiveColumns, err)
+	}
+
+	// Parse schema evolution config
+	schemaEvoCfg, err := parseSchemaEvolutionConfig(conf)
+	if err != nil {
+		return nil, fmt.Errorf("parsing schema evolution config: %w", err)
+	}
+
+	// Parse commit config
+	commitCfg, err := parseCommitConfig(conf)
+	if err != nil {
+		return nil, fmt.Errorf("parsing commit config: %w", err)
+	}
+
+	// Parse row-level operation config
+	rowOpCfg, err := parseRowOpConfig(conf)
+	if err != nil {
+		return nil, fmt.Errorf("parsing row operation config: %w", err)
+	}
+
+	// Keyed (upsert/delete) writes rely on per-key ordering, but with more than
+	// one batch in flight concurrent batches can commit out of order, letting a
+	// stale upsert overwrite a newer one. Config linting flags this, but linting
+	// is advisory and easily skipped, so warn at startup too. mutating() is
+	// conservative — an interpolated row_operation is treated as potentially
+	// mutating.
+	if rowOpCfg.mutating() {
+		if maxInFlight, err := conf.FieldInt(ioFieldMaxInFlight); err == nil && maxInFlight > 1 {
+			mgr.Logger().Warnf("row_operation can produce upsert/delete operations but max_in_flight is %d; concurrent batches may commit out of order and corrupt the last-writer-wins result. Set max_in_flight: 1 for keyed (change-data-capture) workloads.", maxInFlight)
+		}
+	}
+
+	// Copy-on-write trades write amplification for engine-readable (delete-file-
+	// free) tables. Surface that characteristic and its mitigations once at
+	// startup so it is not a surprise in production. This is distinct from the
+	// max_in_flight ordering warning above (which is about correctness, not cost)
+	// and stays silent for merge-on-read and append-only configs.
+	if msg, ok := rowOpCfg.cowAmplificationWarning(); ok {
+		mgr.Logger().Infof("%s", msg)
+	}
+
+	// Cleanup of a failed commit's files is on by default; turning it off is an
+	// incident escape hatch that trades orphaned storage for never deleting
+	// anything. Say so once at startup so the resulting object growth is not a
+	// mystery later — the per-commit skips are logged at debug only.
+	if commitCfg.DisableCleanupOnFailure {
+		mgr.Logger().Infof("%s.%s is disabled: failed commits will leave their written files orphaned in storage on every write path. Run Iceberg table maintenance (snapshot expiry plus orphan-file removal) to reclaim them.", ioFieldCommit, ioFieldCleanupOnFailure)
+	}
+
+	// Parse parquet config
+	var writerOpts []parquet.WriterOption
+	if conf.Contains(ioFieldParquet) {
+		strEnc, err := conf.FieldString(ioFieldParquet, ioFieldParquetStringEncoding)
+		if err != nil {
+			return nil, fmt.Errorf("parsing %s: %w", ioFieldParquetStringEncoding, err)
+		}
+		switch strEnc {
+		case "plain":
+			writerOpts = append(writerOpts, parquet.DefaultEncodingFor(parquet.ByteArray, &parquet.Plain))
+		case "delta_length_byte_array":
+			// default - noop
+		default:
+			return nil, fmt.Errorf("unsupported %s value: %q, please consider raising an issue to request support for feature gap", ioFieldParquetStringEncoding, strEnc)
+		}
+	}
+
+	// Compression is deliberately optional: unset means "defer to the table's
+	// write.parquet.compression-codec property, else uncompressed", which is
+	// resolved per table when its writer is built (resolveParquetCompression).
+	var parquetCompression string
+	if conf.Contains(ioFieldParquet, ioFieldParquetCompression) {
+		if parquetCompression, err = conf.FieldString(ioFieldParquet, ioFieldParquetCompression); err != nil {
+			return nil, fmt.Errorf("parsing %s: %w", ioFieldParquetCompression, err)
+		}
+	}
+
+	rtr := NewRouter(catalogCfg, namespaceStr, tableStr, caseSensitive, schemaEvoCfg, commitCfg, rowOpCfg, writerOpts, mgr.Logger())
+	rtr.metrics = newOpMetrics(mgr.Metrics())
+	rtr.parquetCompression = parquetCompression
+	return &icebergOutput{
+		router: rtr,
+		logger: mgr.Logger(),
+	}, nil
+}
+
+// parseCatalogConfig parses the catalog configuration.
+func parseCatalogConfig(conf *service.ParsedConfig) (catalogx.Config, error) {
+	cfg := catalogx.Config{
+		AuthType: "none", // Default to no auth
+	}
+
+	// Parse catalog URL
+	var err error
+	cfg.URL, err = conf.FieldString(ioFieldCatalog, ioFieldCatalogURL)
+	if err != nil {
+		return cfg, fmt.Errorf("catalog.url is required: %w", err)
+	}
+
+	// Parse warehouse (optional)
+	if conf.Contains(ioFieldCatalog, ioFieldCatalogWarehouse) {
+		cfg.Warehouse, err = conf.FieldString(ioFieldCatalog, ioFieldCatalogWarehouse)
+		if err != nil {
+			return cfg, err
+		}
+	}
+
+	// Parse storage configuration for AdditionalProps
+	cfg.AdditionalProps, err = parseStorageProps(conf)
+	if err != nil {
+		return cfg, err
+	}
+
+	// Parse custom headers (optional)
+	if conf.Contains(ioFieldCatalog, ioFieldCatalogHeaders) {
+		cfg.Headers, err = conf.FieldStringMap(ioFieldCatalog, ioFieldCatalogHeaders)
+		if err != nil {
+			return cfg, err
+		}
+	}
+
+	// Parse TLS skip verify (optional)
+	if conf.Contains(ioFieldCatalog, ioFieldCatalogTLSSkipVer) {
+		cfg.TLSSkipVerify, err = conf.FieldBool(ioFieldCatalog, ioFieldCatalogTLSSkipVer)
+		if err != nil {
+			return cfg, err
+		}
+	}
+
+	// Parse authentication (if present)
+	if !conf.Contains(ioFieldCatalog, ioFieldCatalogAuth) {
+		return cfg, nil // No auth configured
+	}
+
+	// Check for OAuth2
+	if conf.Contains(ioFieldCatalog, ioFieldCatalogAuth, ioFieldCatalogAuthOAuth2) {
+		cfg.AuthType = "oauth2"
+		cfg.OAuth2ClientID, err = conf.FieldString(ioFieldCatalog, ioFieldCatalogAuth, ioFieldCatalogAuthOAuth2, ioFieldOAuth2ClientID)
+		if err != nil {
+			return cfg, err
+		}
+		cfg.OAuth2ClientSecret, err = conf.FieldString(ioFieldCatalog, ioFieldCatalogAuth, ioFieldCatalogAuthOAuth2, ioFieldOAuth2ClientSecret)
+		if err != nil {
+			return cfg, err
+		}
+		serverURI, _ := conf.FieldString(ioFieldCatalog, ioFieldCatalogAuth, ioFieldCatalogAuthOAuth2, ioFieldOAuth2ServerURI)
+		if serverURI != "" {
+			cfg.OAuth2ServerURI, err = url.Parse(serverURI)
+			if err != nil {
+				return cfg, fmt.Errorf("parsing oauth2 server URI: %w", err)
+			}
+		}
+		// Parse OAuth2 scope (optional)
+		if conf.Contains(ioFieldCatalog, ioFieldCatalogAuth, ioFieldCatalogAuthOAuth2, ioFieldOAuth2Scope) {
+			cfg.OAuth2Scope, _ = conf.FieldString(ioFieldCatalog, ioFieldCatalogAuth, ioFieldCatalogAuthOAuth2, ioFieldOAuth2Scope)
+		}
+		return cfg, nil
+	}
+
+	// Check for Bearer token
+	if conf.Contains(ioFieldCatalog, ioFieldCatalogAuth, ioFieldCatalogAuthBearer) {
+		cfg.AuthType = "bearer"
+		cfg.BearerToken, err = conf.FieldString(ioFieldCatalog, ioFieldCatalogAuth, ioFieldCatalogAuthBearer)
+		if err != nil {
+			return cfg, err
+		}
+		return cfg, nil
+	}
+
+	// Check for AWS SigV4
+	if conf.Contains(ioFieldCatalog, ioFieldCatalogAuth, ioFieldCatalogAuthSigV4) {
+		cfg.AuthType = "sigv4"
+		sigv4Conf := conf.Namespace(ioFieldCatalog, ioFieldCatalogAuth, ioFieldCatalogAuthSigV4)
+		awsCfg, err := baws.GetSession(context.Background(), sigv4Conf)
+		if err != nil {
+			return cfg, fmt.Errorf("parsing sigv4 AWS config: %w", err)
+		}
+		cfg.SigV4AwsConfig = &awsCfg
+		cfg.SigV4Region = awsCfg.Region
+		// Parse service
+		if conf.Contains(ioFieldCatalog, ioFieldCatalogAuth, ioFieldCatalogAuthSigV4, ioFieldSigV4Service) {
+			cfg.SigV4Service, err = conf.FieldString(ioFieldCatalog, ioFieldCatalogAuth, ioFieldCatalogAuthSigV4, ioFieldSigV4Service)
+			if err != nil {
+				return cfg, err
+			}
+		}
+	}
+
+	return cfg, nil
+}
+
+// parseStorageProps extracts storage properties from config and returns them as iceberg.Properties.
+func parseStorageProps(conf *service.ParsedConfig) (iceberg.Properties, error) {
+	props := make(iceberg.Properties)
+
+	// Check if storage config exists
+	if !conf.Contains(ioFieldStorage) {
+		return props, nil
+	}
+
+	// Check for S3 configuration
+	if conf.Contains(ioFieldStorage, ioFieldStorageS3) {
+		return parseS3Props(conf)
+	}
+
+	// Check for GCS configuration
+	if conf.Contains(ioFieldStorage, ioFieldStorageGCS) {
+		return parseGCSProps(conf)
+	}
+
+	// Check for Azure configuration
+	if conf.Contains(ioFieldStorage, ioFieldStorageAzure) {
+		return parseAzureProps(conf)
+	}
+
+	return props, nil
+}
+
+// parseS3Props extracts S3 storage properties from the nested s3 config.
+func parseS3Props(conf *service.ParsedConfig) (iceberg.Properties, error) {
+	props := make(iceberg.Properties)
+
+	// Get region
+	if conf.Contains(ioFieldStorage, ioFieldStorageS3, ioFieldS3Region) {
+		region, err := conf.FieldString(ioFieldStorage, ioFieldStorageS3, ioFieldS3Region)
+		if err != nil {
+			return nil, err
+		}
+		props[io.S3Region] = region
+	}
+
+	// Get endpoint
+	if conf.Contains(ioFieldStorage, ioFieldStorageS3, ioFieldS3Endpoint) {
+		endpoint, err := conf.FieldString(ioFieldStorage, ioFieldStorageS3, ioFieldS3Endpoint)
+		if err != nil {
+			return nil, err
+		}
+		props[io.S3EndpointURL] = endpoint
+	}
+
+	// Get force_path_style_urls - explicit setting like the standard S3 connector.
+	// iceberg-go uses S3ForceVirtualAddressing which is the inverse:
+	// - force_path_style_urls=true  → S3ForceVirtualAddressing="false" (path-style)
+	// - force_path_style_urls=false → S3ForceVirtualAddressing="true"  (virtual-hosted, AWS default)
+	forcePathStyle, err := conf.FieldBool(ioFieldStorage, ioFieldStorageS3, ioFieldS3ForcePathStyleURLs)
+	if err != nil {
+		return nil, err
+	}
+	if forcePathStyle {
+		props[io.S3ForceVirtualAddressing] = "false"
+	} else {
+		props[io.S3ForceVirtualAddressing] = "true"
+	}
+
+	// Get static credentials if provided
+	if conf.Contains(ioFieldStorage, ioFieldStorageS3, ioFieldS3Credentials, ioFieldS3CredID) {
+		accessKeyID, err := conf.FieldString(ioFieldStorage, ioFieldStorageS3, ioFieldS3Credentials, ioFieldS3CredID)
+		if err != nil {
+			return nil, err
+		}
+		props[io.S3AccessKeyID] = accessKeyID
+	}
+	if conf.Contains(ioFieldStorage, ioFieldStorageS3, ioFieldS3Credentials, ioFieldS3CredSecret) {
+		secretAccessKey, err := conf.FieldString(ioFieldStorage, ioFieldStorageS3, ioFieldS3Credentials, ioFieldS3CredSecret)
+		if err != nil {
+			return nil, err
+		}
+		props[io.S3SecretAccessKey] = secretAccessKey
+	}
+	if conf.Contains(ioFieldStorage, ioFieldStorageS3, ioFieldS3Credentials, ioFieldS3CredToken) {
+		sessionToken, err := conf.FieldString(ioFieldStorage, ioFieldStorageS3, ioFieldS3Credentials, ioFieldS3CredToken)
+		if err != nil {
+			return nil, err
+		}
+		props[io.S3SessionToken] = sessionToken
+	}
+
+	return props, nil
+}
+
+// parseGCSProps extracts GCS storage properties from the nested gcs config.
+func parseGCSProps(conf *service.ParsedConfig) (iceberg.Properties, error) {
+	props := make(iceberg.Properties)
+
+	// Get endpoint
+	if conf.Contains(ioFieldStorage, ioFieldStorageGCS, ioFieldGCSEndpoint) {
+		endpoint, err := conf.FieldString(ioFieldStorage, ioFieldStorageGCS, ioFieldGCSEndpoint)
+		if err != nil {
+			return nil, err
+		}
+		props[io.GCSEndpoint] = endpoint
+	}
+
+	// Get credentials type
+	if conf.Contains(ioFieldStorage, ioFieldStorageGCS, ioFieldGCSCredType) {
+		credType, err := conf.FieldString(ioFieldStorage, ioFieldStorageGCS, ioFieldGCSCredType)
+		if err != nil {
+			return nil, err
+		}
+		props[io.GCSCredType] = credType
+	}
+
+	// Get credentials file path
+	if conf.Contains(ioFieldStorage, ioFieldStorageGCS, ioFieldGCSKeyPath) {
+		keyPath, err := conf.FieldString(ioFieldStorage, ioFieldStorageGCS, ioFieldGCSKeyPath)
+		if err != nil {
+			return nil, err
+		}
+		props[io.GCSKeyPath] = keyPath
+	}
+
+	// Get credentials JSON
+	if conf.Contains(ioFieldStorage, ioFieldStorageGCS, ioFieldGCSJSONKey) {
+		jsonKey, err := conf.FieldString(ioFieldStorage, ioFieldStorageGCS, ioFieldGCSJSONKey)
+		if err != nil {
+			return nil, err
+		}
+		props[io.GCSJSONKey] = jsonKey
+	}
+
+	return props, nil
+}
+
+// parseAzureProps extracts Azure storage properties from the nested azure config.
+func parseAzureProps(conf *service.ParsedConfig) (iceberg.Properties, error) {
+	props := make(iceberg.Properties)
+
+	// Get storage account name for SAS token prefix
+	storageAccount := ""
+	if conf.Contains(ioFieldStorage, ioFieldStorageAzure, ioFieldAzureStorageAccount) {
+		var err error
+		storageAccount, err = conf.FieldString(ioFieldStorage, ioFieldStorageAzure, ioFieldAzureStorageAccount)
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	// Get container name for SAS token prefix
+	container := ""
+	if conf.Contains(ioFieldStorage, ioFieldStorageAzure, ioFieldAzureContainer) {
+		var err error
+		container, err = conf.FieldString(ioFieldStorage, ioFieldStorageAzure, ioFieldAzureContainer)
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	// Get endpoint
+	if conf.Contains(ioFieldStorage, ioFieldStorageAzure, ioFieldAzureEndpoint) {
+		endpoint, err := conf.FieldString(ioFieldStorage, ioFieldStorageAzure, ioFieldAzureEndpoint)
+		if err != nil {
+			return nil, err
+		}
+		props[io.ADLSEndpoint] = endpoint
+	}
+
+	// Get SAS token - uses container-specific prefix
+	if conf.Contains(ioFieldStorage, ioFieldStorageAzure, ioFieldAzureSASToken) {
+		sasToken, err := conf.FieldString(ioFieldStorage, ioFieldStorageAzure, ioFieldAzureSASToken)
+		if err != nil {
+			return nil, err
+		}
+		// SAS tokens are prefixed with "adls.sas-token.<container>." for container-specific tokens
+		if container != "" {
+			props[io.ADLSSasTokenPrefix+container] = sasToken
+		} else if storageAccount != "" {
+			props[io.ADLSSasTokenPrefix+storageAccount] = sasToken
+		}
+	}
+
+	// Get connection string
+	if conf.Contains(ioFieldStorage, ioFieldStorageAzure, ioFieldAzureConnectionString) {
+		connStr, err := conf.FieldString(ioFieldStorage, ioFieldStorageAzure, ioFieldAzureConnectionString)
+		if err != nil {
+			return nil, err
+		}
+		// Connection strings are prefixed with "adls.connection-string.<account>."
+		if storageAccount != "" {
+			props[io.ADLSConnectionStringPrefix+storageAccount] = connStr
+		}
+	}
+
+	// Get shared key credentials
+	if conf.Contains(ioFieldStorage, ioFieldStorageAzure, ioFieldAzureAccessKey) {
+		key, err := conf.FieldString(ioFieldStorage, ioFieldStorageAzure, ioFieldAzureAccessKey)
+		if err != nil {
+			return nil, err
+		}
+		props[io.ADLSSharedKeyAccountName] = storageAccount
+		props[io.ADLSSharedKeyAccountKey] = key
+	}
+
+	return props, nil
+}
+
+// parseSchemaEvolutionConfig parses the schema evolution configuration.
+func parseSchemaEvolutionConfig(conf *service.ParsedConfig) (SchemaEvolutionConfig, error) {
+	cfg := SchemaEvolutionConfig{}
+
+	// Check if schema evolution config exists
+	if !conf.Contains(ioFieldSchemaEvolution) {
+		return cfg, nil
+	}
+
+	// Parse enabled flag
+	var err error
+	cfg.Enabled, err = conf.FieldBool(ioFieldSchemaEvolution, ioFieldSchemaEvolutionEnabled)
+	if err != nil {
+		return cfg, err
+	}
+
+	// Parse partition spec if present
+	if conf.Contains(ioFieldSchemaEvolution, ioFieldSchemaEvolutionPartitionSpec) {
+		cfg.PartitionSpec, err = conf.FieldInterpolatedString(ioFieldSchemaEvolution, ioFieldSchemaEvolutionPartitionSpec)
+		if err != nil {
+			return cfg, err
+		}
+	}
+
+	// Parse table location prefix if present
+	if conf.Contains(ioFieldSchemaEvolution, ioFieldSchemaEvolutionTableLoc) {
+		cfg.TableLocation, err = conf.FieldString(ioFieldSchemaEvolution, ioFieldSchemaEvolutionTableLoc)
+		if err != nil {
+			return cfg, err
+		}
+	}
+
+	// Parse schema_metadata
+	if conf.Contains(ioFieldSchemaEvolution, ioFieldSchemaEvolutionSchemaMetadata) {
+		cfg.SchemaMetadata, err = conf.FieldString(ioFieldSchemaEvolution, ioFieldSchemaEvolutionSchemaMetadata)
+		if err != nil {
+			return cfg, err
+		}
+	}
+
+	// Parse new_column_type_mapping
+	if conf.Contains(ioFieldSchemaEvolution, ioFieldSchemaEvolutionNewColumnTypeMapping) {
+		cfg.NewColumnTypeMapping, err = conf.Namespace(ioFieldSchemaEvolution).FieldBloblang(ioFieldSchemaEvolutionNewColumnTypeMapping)
+		if err != nil {
+			return cfg, err
+		}
+	}
+
+	// Parse require_schema_metadata. The field carries Default(false) in the
+	// spec so FieldBool returns false-without-error when absent, no Contains
+	// guard required.
+	if cfg.RequireSchemaMetadata, err = conf.FieldBool(ioFieldSchemaEvolution, ioFieldSchemaEvolutionRequireSchemaMetadata); err != nil {
+		return cfg, err
+	}
+	if cfg.RequireSchemaMetadata && cfg.SchemaMetadata == "" {
+		return cfg, fmt.Errorf("%s.%s requires %s.%s to be set", ioFieldSchemaEvolution, ioFieldSchemaEvolutionRequireSchemaMetadata, ioFieldSchemaEvolution, ioFieldSchemaEvolutionSchemaMetadata)
+	}
+
+	return cfg, nil
+}
+
+// parseRowOpConfig parses the row-level operation configuration and validates
+// the static case at startup. When row_operation is a static literal it must be
+// a known operation, and a static upsert/delete requires identifier_fields.
+// Dynamic (interpolated) operations cannot be checked here, so they are
+// validated per message at write time (a hard error on an unknown value or a
+// missing identifier_fields key, never a silent insert).
+func parseRowOpConfig(conf *service.ParsedConfig) (RowOpConfig, error) {
+	cfg := RowOpConfig{}
+
+	op, err := conf.FieldInterpolatedString(ioFieldRowOperation)
+	if err != nil {
+		return cfg, err
+	}
+	cfg.Operation = op
+
+	cfg.IdentifierFields, err = conf.FieldStringList(ioFieldIdentifierFields)
+	if err != nil {
+		return cfg, err
+	}
+
+	// merge_strategy carries Default(merge-on-read) and is a validated enum, so
+	// FieldString returns a known value without a Contains guard.
+	strategy, err := conf.FieldString(ioFieldMergeStrategy)
+	if err != nil {
+		return cfg, err
+	}
+	switch mergeStrategy(strategy) {
+	case mergeStrategyMOR, mergeStrategyCOW:
+		cfg.MergeStrategy = mergeStrategy(strategy)
+	default:
+		return cfg, fmt.Errorf("invalid %s %q: must be %q or %q", ioFieldMergeStrategy, strategy, mergeStrategyMOR, mergeStrategyCOW)
+	}
+
+	if static, ok := op.Static(); ok {
+		parsed, err := parseRowOperation(static)
+		if err != nil {
+			return cfg, err
+		}
+		if (parsed == rowOpUpsert || parsed == rowOpDelete) && len(cfg.IdentifierFields) == 0 {
+			return cfg, fmt.Errorf("%s %q requires %s to be set", ioFieldRowOperation, parsed, ioFieldIdentifierFields)
+		}
+	}
+
+	return cfg, nil
+}
+
+// parseCommitConfig parses the commit configuration.
+func parseCommitConfig(conf *service.ParsedConfig) (CommitConfig, error) {
+	cfg := CommitConfig{
+		ManifestMergeEnabled: true,
+		MaxSnapshotAge:       24 * time.Hour,
+		MaxRetries:           3,
+	}
+	if !conf.Contains(ioFieldCommit) {
+		return cfg, nil
+	}
+	var err error
+	cfg.ManifestMergeEnabled, err = conf.FieldBool(ioFieldCommit, ioFieldManifestMergeEnabled)
+	if err != nil {
+		return cfg, err
+	}
+	cfg.MaxSnapshotAge, err = conf.FieldDuration(ioFieldCommit, ioFieldMaxSnapshotAge)
+	if err != nil {
+		return cfg, err
+	}
+	cfg.MaxRetries, err = conf.FieldInt(ioFieldCommit, ioFieldMaxCommitRetries)
+	if err != nil {
+		return cfg, err
+	}
+	// The config field is positively named (`cleanup_on_failure`, defaulting to
+	// true) while the Go field is the negation, so that a zero-value
+	// CommitConfig keeps cleanup enabled — see CommitConfig.
+	cleanupOnFailure, err := conf.FieldBool(ioFieldCommit, ioFieldCleanupOnFailure)
+	if err != nil {
+		return cfg, err
+	}
+	cfg.DisableCleanupOnFailure = !cleanupOnFailure
+	return cfg, nil
+}
+
+// Connect establishes connections to the catalog and storage.
+func (o *icebergOutput) Connect(_ context.Context) error {
+	o.logger.Info("Iceberg output ready")
+	return nil
+}
+
+// WriteBatch writes a batch of messages to the Iceberg table.
+func (o *icebergOutput) WriteBatch(ctx context.Context, batch service.MessageBatch) error {
+	return o.router.Route(ctx, batch)
+}
+
+// Close closes the output and releases resources.
+func (o *icebergOutput) Close(_ context.Context) error {
+	o.router.Close()
+	return nil
+}

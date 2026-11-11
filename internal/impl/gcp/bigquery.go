@@ -1,0 +1,220 @@
+// Copyright 2024 Redpanda Data, Inc.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//    http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package gcp
+
+import (
+	"context"
+	"fmt"
+
+	"cloud.google.com/go/bigquery"
+	"github.com/Masterminds/squirrel"
+	"go.uber.org/multierr"
+
+	"github.com/redpanda-data/benthos/v4/public/service"
+)
+
+type bigqueryIterator interface {
+	Next(dst any) error
+}
+
+type bqClient interface {
+	RunQuery(ctx context.Context, options *bqQueryBuilderOptions) (bigqueryIterator, error)
+	Close() error
+}
+
+func wrapBQClient(client *bigquery.Client, logger *service.Logger) bqClient {
+	return &wrappedBQClient{wrapped: client, logger: logger}
+}
+
+type wrappedBQClient struct {
+	wrapped *bigquery.Client
+	logger  *service.Logger
+}
+
+func (client *wrappedBQClient) RunQuery(ctx context.Context, options *bqQueryBuilderOptions) (bigqueryIterator, error) {
+	query, err := buildBQQuery(client.wrapped, options)
+	if err != nil {
+		return nil, fmt.Errorf("building query: %w", err)
+	}
+
+	job, err := query.Run(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("running query: %w", err)
+	}
+
+	client.logger.With("job_id", job.ID()).Debug("running bigquery job")
+
+	status, err := job.Wait(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("waiting on job: %w", err)
+	}
+
+	if err := errorFromStatus(status); err != nil {
+		return nil, err
+	}
+
+	it, err := job.Read(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("reading rows: %w", err)
+	}
+
+	return it, nil
+}
+
+func (client *wrappedBQClient) Close() error {
+	return client.wrapped.Close()
+}
+
+type bqQueryParts struct {
+	table   string
+	columns []string
+	where   string
+	prefix  string
+	suffix  string
+}
+
+type bqQueryBuilderOptions struct {
+	queryParts    *bqQueryParts
+	jobLabels     map[string]string
+	queryPriority bigquery.QueryPriority
+	args          []any
+}
+
+func buildBQQuery(client *bigquery.Client, options *bqQueryBuilderOptions) (*bigquery.Query, error) {
+	queryParts := options.queryParts
+
+	builder := squirrel.
+		Select(queryParts.columns...).
+		From(fmt.Sprintf("`%s`", queryParts.table)).
+		Where(queryParts.where, options.args...)
+
+	if queryParts.prefix != "" {
+		builder = builder.Prefix(queryParts.prefix)
+	}
+	if queryParts.suffix != "" {
+		builder = builder.Suffix(queryParts.suffix)
+	}
+
+	qs, args, err := builder.PlaceholderFormat(squirrel.Question).ToSql()
+	if err != nil {
+		return nil, fmt.Errorf("building query string: %w", err)
+	}
+
+	query := client.Query(qs)
+	query.Labels = options.jobLabels
+	query.Priority = options.queryPriority
+
+	bqparams := make([]bigquery.QueryParameter, 0, len(args))
+	for _, arg := range args {
+		bqparams = append(bqparams, bigquery.QueryParameter{Value: arg})
+	}
+
+	query.Parameters = bqparams
+
+	return query, nil
+}
+
+func errorFromStatus(status *bigquery.JobStatus) error {
+	// status.Err() tells us that the job _completed unsuccessfully_.
+	// If that is set, then we can proceed to look at status.Errors.
+	statusErr := status.Err()
+	if statusErr == nil {
+		return nil
+	}
+
+	var bqErr error
+
+	if len(status.Errors) > 0 {
+		for _, cerr := range status.Errors {
+			bqErr = multierr.Append(bqErr, cerr)
+		}
+	} else {
+		bqErr = statusErr
+	}
+
+	return fmt.Errorf("completing bigquery job successfully: %w", bqErr)
+}
+
+func parseQueryPriority(config *service.ParsedConfig, fieldName string) (bigquery.QueryPriority, error) {
+	if !config.Contains(fieldName) {
+		return "", nil
+	}
+
+	rawPriority, err := config.FieldString(fieldName)
+	if err != nil {
+		return "", err
+	}
+
+	switch rawPriority {
+	case "interactive":
+		return bigquery.InteractivePriority, nil
+	case "batch":
+		return bigquery.BatchPriority, nil
+	case "":
+		return "", nil
+	default:
+		return "", fmt.Errorf("unrecognised query priority: %s", rawPriority)
+	}
+}
+
+// Fields shared by the gcp_bigquery_select input and processor.
+
+func bqSelectProjectField() *service.ConfigField {
+	return service.NewStringField("project").
+		Description("The GCP project where the query job runs.")
+}
+
+func bqSelectTableField() *service.ConfigField {
+	return service.NewStringField("table").
+		Description("The fully-qualified name of the BigQuery table to query.").
+		Example("bigquery-public-data.samples.shakespeare")
+}
+
+func bqSelectWhereField() *service.ConfigField {
+	return service.NewStringField("where").
+		Description("An optional `WHERE` clause to add to the query. The `args_mapping` field populates the placeholder arguments. Placeholders must always be question marks (`?`).").
+		ShortDescription("An optional where clause. Placeholders must be question marks, populated from args_mapping.").
+		Example("type = ? and created_at > ?").
+		Example("user_id = ?").
+		Optional()
+}
+
+func bqSelectArgsMappingField() *service.ConfigField {
+	return service.NewBloblangField("args_mapping").
+		Description("An optional xref:guides:bloblang/about.adoc[Bloblang mapping] that evaluates to an array of values for the `?` placeholders in the `where` field, in order. Each value is sent to BigQuery as a positional query parameter.").
+		ShortDescription("Bloblang mapping evaluating to an array of values matching the placeholder arguments in where.").
+		Example(`root = [ "article", now().ts_format("2006-01-02") ]`).
+		Optional()
+}
+
+func bqSelectPrefixField() *service.ConfigField {
+	return service.NewStringField("prefix").
+		Description("Optional GoogleSQL text to add before the `SELECT` keyword of the generated query, for example a `WITH` clause.").
+		Optional()
+}
+
+func bqSelectSuffixField() *service.ConfigField {
+	return service.NewStringField("suffix").
+		Description("Optional GoogleSQL text to append after the generated query, for example `GROUP BY`, `ORDER BY`, or `LIMIT` clauses.").
+		Optional()
+}
+
+// bqJobLabelsField returns the job_labels field for a component that runs
+// BigQuery jobs of the given kind, such as "query" or "load".
+func bqJobLabelsField(jobKind string) *service.ConfigField {
+	return service.NewStringMapField("job_labels").
+		Description("A map of labels to add to the " + jobKind + " job.").
+		Default(map[string]any{})
+}

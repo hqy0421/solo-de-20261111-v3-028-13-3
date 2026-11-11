@@ -1,0 +1,187 @@
+// Copyright 2025 Redpanda Data, Inc.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//    http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package migrator
+
+import (
+	"bytes"
+	"context"
+	"log/slog"
+	"maps"
+	"slices"
+	"testing"
+	"time"
+
+	"github.com/twmb/franz-go/pkg/kadm"
+	"github.com/twmb/franz-go/pkg/kgo"
+	"github.com/twmb/franz-go/pkg/sr"
+
+	"github.com/redpanda-data/benthos/v4/public/service"
+)
+
+var (
+	TopicDetailsWithClient = topicDetailsWithClient
+	DescribeACLs           = describeACLs
+	SchemaStringEquals     = schemaStringEquals
+	EncodeOffsetHeader     = encodeOffsetHeader
+)
+
+type PartialSyncError = partialSyncError
+
+func ReadRecordTimestamp(
+	ctx context.Context,
+	client *kgo.Client,
+	topic string,
+	topicID kadm.TopicID,
+	partition int32,
+	offset int64,
+	fetchTimeout time.Duration,
+) (time.Time, error) {
+	r, err := readRecordAtOffset(ctx, client, topic, topicID, partition, offset, fetchTimeout)
+	if err != nil {
+		return time.Time{}, err
+	}
+	return r.Timestamp, nil
+}
+
+func NewTopicMigratorForTesting(t *testing.T, conf TopicMigratorConfig) *topicMigrator {
+	var buf bytes.Buffer
+	t.Cleanup(func() {
+		t.Log(buf.String())
+	})
+	return &topicMigrator{
+		conf: conf,
+		log: service.NewLoggerFromSlog(
+			slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{
+				Level: slog.LevelDebug,
+			}))),
+		knownTopics: make(map[string]TopicMapping),
+	}
+}
+
+func NewSchemaRegistryMigratorForTesting(t *testing.T, conf SchemaRegistryMigratorConfig, src, dst *sr.Client) *schemaRegistryMigrator {
+	var buf bytes.Buffer
+	t.Cleanup(func() {
+		t.Log(buf.String())
+	})
+	conf.MaxParallelHTTPRequests = 2
+	return &schemaRegistryMigrator{
+		conf:   conf,
+		src:    src,
+		srcURL: "src",
+		dst:    dst,
+		dstURL: "dst",
+		log: service.NewLoggerFromSlog(slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{
+			Level: slog.LevelDebug,
+		}))),
+		knownSubjects: make(map[schemaSubjectVersion]struct{}),
+		schemas:       make(map[int]schemaState),
+
+		retryMinBackoff: 100 * time.Millisecond,
+		retryMaxBackoff: time.Second,
+	}
+}
+
+// SetMaxParallelHTTPRequests overrides the number of sync workers set by
+// NewSchemaRegistryMigratorForTesting.
+func (m *schemaRegistryMigrator) SetMaxParallelHTTPRequests(n int) {
+	m.conf.MaxParallelHTTPRequests = n
+}
+
+// SyncRoots syncs only the given root subjects, as the retry loop does.
+func (m *schemaRegistryMigrator) SyncRoots(ctx context.Context, subjects ...string) error {
+	roots := make(map[string]struct{}, len(subjects))
+	for _, s := range subjects {
+		roots[s] = struct{}{}
+	}
+	return m.sync(ctx, roots)
+}
+
+// FailedRoots returns the root subjects that the retry loop would retry.
+func (m *schemaRegistryMigrator) FailedRoots() []string {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return slices.Sorted(maps.Keys(m.failedRoots))
+}
+
+func (m *schemaRegistryMigrator) DfsSubjectSchemasFunc(
+	ctx context.Context,
+	client *sr.Client,
+	root sr.SubjectSchema,
+	filter func(subject string, version int) bool,
+	cb func(sr.SubjectSchema) error,
+) error {
+	return m.dfsSubjectSchemasFunc(ctx, client, root, filter, cb)
+}
+
+func NewGroupsMigratorForTesting(
+	t *testing.T,
+	conf GroupsMigratorConfig,
+	src, dst *kgo.Client,
+	srcAdm, dstAdm *kadm.Client,
+) *groupsMigrator {
+	var buf bytes.Buffer
+	t.Cleanup(func() {
+		t.Log(buf.String())
+	})
+	return &groupsMigrator{
+		conf:         conf,
+		offsetHeader: DefaultOffsetHeader,
+		src:          src,
+		srcAdm:       srcAdm,
+		dst:          dst,
+		dstAdm:       dstAdm,
+		log: service.NewLoggerFromSlog(slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{
+			Level: slog.LevelDebug,
+		}))),
+		topicIDs:        make(map[string]kadm.TopicID),
+		dstTopicIDs:     make(map[string]kadm.TopicID),
+		commitedOffsets: make(map[string]map[string]map[int32][2]int64),
+	}
+}
+
+func NewMigratorForSchemaIDTranslationTesting(t *testing.T, strict bool, idMap map[int]int, topics ...string) *Migrator {
+	t.Helper()
+
+	m := &Migrator{
+		topic: topicMigrator{knownTopics: make(map[string]TopicMapping)},
+		sr: schemaRegistryMigrator{
+			conf: SchemaRegistryMigratorConfig{
+				Enabled:      true,
+				TranslateIDs: true,
+				Strict:       strict,
+			},
+			src:     &sr.Client{},
+			dst:     &sr.Client{},
+			schemas: make(map[int]schemaState),
+		},
+		log: service.MockResources().Logger(),
+		src: &kgo.Client{},
+	}
+	m.topic.log, m.sr.log = m.log, m.log
+	for srcID, dstID := range idMap {
+		m.sr.setSchemaSynced(sr.SubjectSchema{Subject: "s", Version: 1, ID: srcID}, schemaInfo{Subject: "s", Version: 1, ID: dstID})
+	}
+	for _, topic := range topics {
+		m.topic.knownTopics[topic] = TopicMapping{
+			Src: TopicInfo{Topic: topic, Partitions: 1},
+			Dst: TopicInfo{Topic: topic, Partitions: 1},
+		}
+	}
+	return m
+}
+
+func (m *Migrator) MessageBatchToFranzRecords(batch service.MessageBatch) ([]kgo.Record, error) {
+	return m.messageBatchToFranzRecords(batch)
+}

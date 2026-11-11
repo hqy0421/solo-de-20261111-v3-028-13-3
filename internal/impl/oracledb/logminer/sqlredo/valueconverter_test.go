@@ -1,0 +1,484 @@
+// Copyright 2026 Redpanda Data, Inc.
+//
+// Licensed as a Redpanda Enterprise file under the Redpanda Community
+// License (the "License"); you may not use this file except in compliance with
+// the License. You may obtain a copy of the License at
+//
+// https://github.com/redpanda-data/connect/blob/main/licenses/rcl.md
+
+package sqlredo
+
+import (
+	"encoding/json"
+	"testing"
+	"time"
+
+	"github.com/stretchr/testify/assert"
+)
+
+func TestConvertDateValue(t *testing.T) {
+	converter := NewOracleValueConverter(time.UTC)
+
+	tests := []struct {
+		name     string
+		input    string
+		wantTime time.Time
+		wantNil  bool
+	}{
+		{
+			name:     "TO_DATE with standard format",
+			input:    "TO_DATE('2020-01-15','YYYY-MM-DD')",
+			wantTime: time.Date(2020, 1, 15, 0, 0, 0, 0, time.UTC),
+		},
+		{
+			name:     "TO_DATE with timestamp",
+			input:    "TO_DATE('2020-01-15 10:30:00','YYYY-MM-DD HH24:MI:SS')",
+			wantTime: time.Date(2020, 1, 15, 10, 30, 0, 0, time.UTC),
+		},
+		{
+			name:     "TO_DATE with month name",
+			input:    "TO_DATE('15-Jan-20','DD-MON-YY')",
+			wantTime: time.Date(2020, 1, 15, 0, 0, 0, 0, time.UTC),
+		},
+		{
+			name:    "not a TO_DATE call",
+			input:   "2020-01-15",
+			wantNil: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := converter.convertDateValue(tt.input)
+			if tt.wantNil {
+				assert.Nil(t, result)
+				return
+			}
+			assert.Equal(t, tt.wantTime, result)
+		})
+	}
+}
+
+func TestConvertTimestampValue(t *testing.T) {
+	converter := NewOracleValueConverter(time.UTC)
+
+	tests := []struct {
+		name     string
+		input    string
+		wantTime time.Time
+		wantNil  bool
+	}{
+		{
+			name:     "TO_TIMESTAMP without fractional seconds",
+			input:    "TO_TIMESTAMP('2020-01-15 10:30:00','YYYY-MM-DD HH24:MI:SS')",
+			wantTime: time.Date(2020, 1, 15, 10, 30, 0, 0, time.UTC),
+		},
+		{
+			name:     "TO_TIMESTAMP with milliseconds",
+			input:    "TO_TIMESTAMP('2020-01-15 10:30:00.123','YYYY-MM-DD HH24:MI:SS.FF3')",
+			wantTime: time.Date(2020, 1, 15, 10, 30, 0, 123000000, time.UTC),
+		},
+		{
+			name:     "TO_TIMESTAMP with microseconds",
+			input:    "TO_TIMESTAMP('2020-01-15 10:30:00.123456','YYYY-MM-DD HH24:MI:SS.FF6')",
+			wantTime: time.Date(2020, 1, 15, 10, 30, 0, 123456000, time.UTC),
+		},
+		{
+			name:     "TO_TIMESTAMP with nanoseconds",
+			input:    "TO_TIMESTAMP('2020-01-15 10:30:00.123456789','YYYY-MM-DD HH24:MI:SS.FF9')",
+			wantTime: time.Date(2020, 1, 15, 10, 30, 0, 123456789, time.UTC),
+		},
+		{
+			name:     "TO_TIMESTAMP without format string",
+			input:    "TO_TIMESTAMP('2020-01-15 10:30:00')",
+			wantTime: time.Date(2020, 1, 15, 10, 30, 0, 0, time.UTC),
+		},
+		{
+			name:     "TO_TIMESTAMP with AM/PM format",
+			input:    "TO_TIMESTAMP('15-Jan-20 10.30.00 AM')",
+			wantTime: time.Date(2020, 1, 15, 10, 30, 0, 0, time.UTC),
+		},
+		{
+			name:    "not a TO_TIMESTAMP call",
+			input:   "2020-01-15 10:30:00",
+			wantNil: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := converter.convertTimestampValue(tt.input)
+			if tt.wantNil {
+				assert.Nil(t, result)
+				return
+			}
+			assert.Equal(t, tt.wantTime, result)
+		})
+	}
+}
+
+func TestConvertTimestampWithZone(t *testing.T) {
+	converter := NewOracleValueConverter(time.UTC)
+
+	tests := []struct {
+		name     string
+		input    string
+		wantTime time.Time
+		wantNil  bool
+	}{
+		{
+			name:     "TO_TIMESTAMP_TZ with UTC",
+			input:    "TO_TIMESTAMP_TZ('2020-01-15 10:30:00 +00:00')",
+			wantTime: time.Date(2020, 1, 15, 10, 30, 0, 0, time.UTC),
+		},
+		{
+			name:     "TO_TIMESTAMP_TZ with offset",
+			input:    "TO_TIMESTAMP_TZ('2020-01-15 10:30:00 -05:00')",
+			wantTime: time.Date(2020, 1, 15, 15, 30, 0, 0, time.UTC),
+		},
+		{
+			name:     "TO_TIMESTAMP_TZ with microseconds",
+			input:    "TO_TIMESTAMP_TZ('2020-01-15 10:30:00.123456 +00:00')",
+			wantTime: time.Date(2020, 1, 15, 10, 30, 0, 123456000, time.UTC),
+		},
+		{
+			name:    "not a TO_TIMESTAMP_TZ call",
+			input:   "2020-01-15 10:30:00",
+			wantNil: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := converter.convertTimestampWithZone(tt.input)
+			if tt.wantNil {
+				assert.Nil(t, result)
+				return
+			}
+			// convertTimestampWithZone preserves the parsed timezone rather than
+			// normalising to UTC, so compare the instant with time.Equal rather
+			// than the full time.Time value (which includes the location).
+			gotTime, ok := result.(time.Time)
+			assert.True(t, ok, "expected time.Time, got %T", result)
+			assert.True(t, gotTime.Equal(tt.wantTime), "got %v, want %v", gotTime, tt.wantTime)
+		})
+	}
+}
+
+func TestConvertRawValue(t *testing.T) {
+	converter := NewOracleValueConverter(time.UTC)
+
+	tests := []struct {
+		name      string
+		input     string
+		wantBytes []byte
+		wantStr   string
+	}{
+		{
+			name:      "HEXTORAW simple",
+			input:     "HEXTORAW('48656C6C6F')",
+			wantBytes: []byte("Hello"),
+		},
+		{
+			name:      "HEXTORAW with lowercase",
+			input:     "hextoraw('776f726c64')",
+			wantBytes: []byte("world"),
+		},
+		{
+			name:    "not a HEXTORAW call",
+			input:   "48656C6C6F",
+			wantStr: "48656C6C6F",
+		},
+		{
+			// Regression: odd-length hex must not panic (previously sliced out of
+			// range). Malformed input is returned untouched.
+			name:    "HEXTORAW odd-length hex is returned untouched, no panic",
+			input:   "HEXTORAW('123')",
+			wantStr: "HEXTORAW('123')",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := converter.convertRawValue(tt.input)
+			if tt.wantBytes != nil {
+				assert.Equal(t, tt.wantBytes, result)
+			} else {
+				assert.Equal(t, tt.wantStr, result)
+			}
+		})
+	}
+}
+
+func TestConvertUnistrValue(t *testing.T) {
+	converter := NewOracleValueConverter(time.UTC)
+
+	tests := []struct {
+		name  string
+		input string
+		want  any
+	}{
+		{
+			name:  "UNISTR with unicode escape",
+			input: `UNISTR('caf\00e9')`,
+			want:  "café",
+		},
+		{
+			name:  "UNISTR pure ASCII",
+			input: `UNISTR('hello')`,
+			want:  "hello",
+		},
+		{
+			name:  "UNISTR concatenation via ||",
+			input: `UNISTR('caf\00e9') || UNISTR(' \2603')`, // é then snowman
+			want:  "café ☃",
+		},
+		{
+			name:  "UNISTR surrogate pair (U+1F600)",
+			input: `UNISTR('\d83d\de00')`,
+			want:  "😀",
+		},
+		{
+			name:  "UNISTR escaped backslash",
+			input: `UNISTR('a\\b')`,
+			want:  `a\b`,
+		},
+		{
+			name:  "not a UNISTR call returns nil",
+			input: "TO_DATE('2020-01-15','YYYY-MM-DD')",
+			want:  nil,
+		},
+		{
+			// A mixed expression is rejected (nil) rather than silently dropping
+			// the plain literal — the caller keeps the raw value untouched.
+			name:  "mixed UNISTR and plain literal returns nil (no silent drop)",
+			input: `UNISTR('a') || 'plain' || UNISTR('b')`,
+			want:  nil,
+		},
+		{
+			name:  "value merely containing UNISTR is not decoded",
+			input: `MYUNISTR('x')`,
+			want:  nil,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, tt.want, converter.convertUnistrValue(tt.input))
+		})
+	}
+}
+
+func TestConvertLobValue(t *testing.T) {
+	converter := NewOracleValueConverter(time.UTC)
+
+	tests := []struct {
+		name      string
+		input     string
+		wantEmpty bool
+		wantStr   string
+	}{
+		{
+			name:      "EMPTY_CLOB()",
+			input:     "EMPTY_CLOB()",
+			wantEmpty: true,
+		},
+		{
+			name:      "EMPTY_BLOB()",
+			input:     "EMPTY_BLOB()",
+			wantEmpty: true,
+		},
+		{
+			name:    "regular string",
+			input:   "some text",
+			wantStr: "some text",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := converter.convertLobValue(tt.input)
+			if tt.wantEmpty {
+				assert.IsType(t, []byte{}, result)
+				assert.Empty(t, result)
+			} else {
+				assert.Equal(t, tt.wantStr, result)
+			}
+		})
+	}
+}
+
+func TestConvertValue(t *testing.T) {
+	converter := NewOracleValueConverter(time.UTC)
+
+	tests := []struct {
+		name      string
+		input     any
+		wantValue any
+	}{
+		{
+			name:      "TO_DATE function call",
+			input:     "TO_DATE('2020-01-15','YYYY-MM-DD')",
+			wantValue: time.Date(2020, 1, 15, 0, 0, 0, 0, time.UTC),
+		},
+		{
+			name:      "TO_TIMESTAMP function call",
+			input:     "TO_TIMESTAMP('2020-01-15 10:30:00','YYYY-MM-DD HH24:MI:SS')",
+			wantValue: time.Date(2020, 1, 15, 10, 30, 0, 0, time.UTC),
+		},
+		{
+			name:      "HEXTORAW function call",
+			input:     "HEXTORAW('48656C6C6F')",
+			wantValue: []byte("Hello"),
+		},
+		{
+			name:      "EMPTY_CLOB function call",
+			input:     "EMPTY_CLOB()",
+			wantValue: []byte{},
+		},
+		{
+			name:      "EMPTY_BLOB function call",
+			input:     "EMPTY_BLOB()",
+			wantValue: []byte{},
+		},
+		{
+			name:      "plain string passes through",
+			input:     "Hello World",
+			wantValue: "Hello World",
+		},
+		{
+			name:      "bare integer literal converts to int64",
+			input:     "123",
+			wantValue: int64(123),
+		},
+		{
+			name:      "bare negative integer converts to int64",
+			input:     "-89",
+			wantValue: int64(-89),
+		},
+		{
+			name:      "bare zero converts to int64",
+			input:     "0",
+			wantValue: int64(0),
+		},
+		{
+			name:      "bare max int64 converts to int64",
+			input:     "9223372036854775807",
+			wantValue: int64(9223372036854775807),
+		},
+		{
+			name:      "bare value exceeding int64 converts to json.Number",
+			input:     "9223372036854775808",
+			wantValue: json.Number("9223372036854775808"),
+		},
+		{
+			name:      "bare decimal literal converts to json.Number",
+			input:     "45.67",
+			wantValue: json.Number("45.67"),
+		},
+		{
+			name:      "bare decimal without leading zero normalised to json.Number",
+			input:     ".5",
+			wantValue: json.Number("0.5"),
+		},
+		{
+			name:      "bare negative decimal without leading zero normalised to json.Number",
+			input:     "-.5",
+			wantValue: json.Number("-0.5"),
+		},
+		{
+			name:      "bare scientific notation converts to json.Number",
+			input:     "1.79E+100",
+			wantValue: json.Number("1.79E+100"),
+		},
+		{
+			name:      "Oracle BINARY_FLOAT format converts to json.Number",
+			input:     "3.3999999E+037",
+			wantValue: json.Number("3.3999999E+037"),
+		},
+		{
+			name:      "NaN rejected stays string",
+			input:     "NaN",
+			wantValue: "NaN",
+		},
+		{
+			name:      "Inf rejected stays string",
+			input:     "Inf",
+			wantValue: "Inf",
+		},
+		{
+			name:      "+Inf rejected stays string",
+			input:     "+Inf",
+			wantValue: "+Inf",
+		},
+		{
+			name:      "-Inf rejected stays string",
+			input:     "-Inf",
+			wantValue: "-Inf",
+		},
+		{
+			name:      "non-string value passes through",
+			input:     123,
+			wantValue: 123,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := converter.ConvertValue(tt.input)
+			assert.IsType(t, tt.wantValue, result)
+			assert.Equal(t, tt.wantValue, result)
+		})
+	}
+}
+
+func TestConvertValueJSONMarshalRoundtrip(t *testing.T) {
+	// Ensure that all json.Number values produced by ConvertValue are valid JSON
+	// and can be round-tripped through json.Marshal without error.
+	converter := NewOracleValueConverter(time.UTC)
+
+	inputs := []string{
+		".5", "-.5", ".123456", "-.999",
+		"45.67", "-45.67", "0.5", "1.79E+100", "3.3999999E+037",
+		"9223372036854775808",
+	}
+	for _, input := range inputs {
+		t.Run(input, func(t *testing.T) {
+			result := converter.ConvertValue(input)
+			jn, ok := result.(json.Number)
+			if !ok {
+				return // not a json.Number, skip
+			}
+			_, err := json.Marshal(jn)
+			assert.NoErrorf(t, err, "json.Marshal(json.Number(%q)) should not fail", string(jn))
+		})
+	}
+}
+
+// Benchmark tests
+func BenchmarkConvertTimestamp(b *testing.B) {
+	converter := NewOracleValueConverter(time.UTC)
+	input := "TO_TIMESTAMP('2020-01-15 10:30:00.123456','YYYY-MM-DD HH24:MI:SS.FF6')"
+
+	for b.Loop() {
+		converter.ConvertValue(input)
+	}
+}
+
+func BenchmarkConvertDate(b *testing.B) {
+	converter := NewOracleValueConverter(time.UTC)
+	input := "TO_DATE('2020-01-15','YYYY-MM-DD')"
+
+	for b.Loop() {
+		converter.ConvertValue(input)
+	}
+}
+
+func BenchmarkConvertRaw(b *testing.B) {
+	converter := NewOracleValueConverter(time.UTC)
+	input := "HEXTORAW('48656C6C6F576F726C64')"
+
+	for b.Loop() {
+		converter.ConvertValue(input)
+	}
+}

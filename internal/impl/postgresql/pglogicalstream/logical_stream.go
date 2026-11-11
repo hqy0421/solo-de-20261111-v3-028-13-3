@@ -1,0 +1,1208 @@
+// Copyright 2024 Redpanda Data, Inc.
+//
+// Licensed as a Redpanda Enterprise file under the Redpanda Community
+// License (the "License"); you may not use this file except in compliance with
+// the License. You may obtain a copy of the License at
+//
+// https://github.com/redpanda-data/connect/v4/blob/main/licenses/rcl.md
+
+package pglogicalstream
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"slices"
+	"strings"
+	"sync"
+	"time"
+
+	"github.com/Jeffail/shutdown"
+	"github.com/jackc/pgx/v5/pgconn"
+	"github.com/jackc/pgx/v5/pgproto3"
+	"github.com/jackc/pgx/v5/pgtype"
+	"golang.org/x/sync/errgroup"
+
+	"github.com/redpanda-data/benthos/v4/public/service"
+
+	"github.com/redpanda-data/connect/v4/internal/asyncroutine"
+	"github.com/redpanda-data/connect/v4/internal/impl/postgresql/pglogicalstream/sanitize"
+	"github.com/redpanda-data/connect/v4/internal/replication/incrementalsnapshot"
+)
+
+const decodingPlugin = "pgoutput"
+
+// Stream is a structure that represents a logical replication stream
+// It includes the connection to the database, the context for the stream, and snapshotting functionality
+type Stream struct {
+	pgConn *pgconn.PgConn
+
+	shutSig *shutdown.Signaller
+
+	// The LSN acked by the stream, we may not have acked this to postgres yet (ack, ack, ack)
+	ackedLSN   LSN
+	ackedLSNMu sync.Mutex
+
+	standbyMessageTimeout time.Duration
+	messages              chan []StreamMessage
+	errors                chan error
+
+	// snapshotAcked is closed (once) by the input layer via
+	// MarkSnapshotAcknowledged once every snapshot message has been acknowledged
+	// downstream, unblocking promotion of the replication slot.
+	snapshotAcked     chan struct{}
+	snapshotAckedOnce sync.Once
+
+	includeTxnMarkers       bool
+	slotName                string
+	tables                  []TableFQN
+	snapshotBatchSize       int
+	decodingPluginArguments []string
+	logger                  *service.Logger
+	monitor                 *Monitor
+	heartbeat               *heartbeat
+	maxSnapshotWorkers      int
+	unchangedToastValue     any
+
+	// externallyManagedPublication means the publication is owned outside
+	// the connector: it is validated rather than created or altered, and may
+	// change while the stream runs.
+	externallyManagedPublication bool
+
+	// streamMaxRows caps the rows the streaming reader accumulates before
+	// handing a batch to the consumer. Defaults to streamBatchMaxRows; named
+	// to avoid clashing with that constant.
+	streamMaxRows      int
+	pgVersion          int
+	signalTable        *incrementalsnapshot.TableID
+	incSnapshot        incrementalSnapshot
+	snapshotSchema     string
+	IsBlockingSnapshot bool
+}
+
+// NewPgStream creates a new instance of the Stream struct.
+func NewPgStream(ctx context.Context, config *Config) (*Stream, error) {
+	if config.ReplicationSlotName == "" {
+		return nil, errors.New("missing replication slot name")
+	}
+
+	// Cleanup state - this will be accumulated as the function progresses and cleared
+	// if we successfully create a stream.
+	var cleanups []func()
+	defer func() {
+		for _, cleanup := range slices.Backward(cleanups) {
+			cleanup()
+		}
+	}()
+
+	debugger := asyncroutine.NewPeriodic(5*time.Second, func() {
+		config.Logger.Debug("Waiting to ping database...")
+	})
+	debugger.Start()
+	dbConn, err := pgconn.ConnectConfig(ctx, config.DBConfig.Copy())
+	debugger.Stop()
+	if err != nil {
+		return nil, err
+	}
+	cleanups = append(cleanups, func() {
+		if err := dbConn.Close(ctx); err != nil {
+			config.Logger.Warnf("unable to properly cleanup db connection on stream creation failure: %s", err)
+		}
+	})
+
+	if err = dbConn.Ping(ctx); err != nil {
+		return nil, err
+	}
+
+	schema, err := sanitize.NormalizePostgresIdentifier(config.DBSchema)
+	if err != nil {
+		return nil, fmt.Errorf("invalid schema name %q: %w", config.DBSchema, err)
+	}
+
+	tables := []TableFQN{}
+	for _, table := range config.DBTables {
+		normalized, err := sanitize.NormalizePostgresIdentifier(table)
+		if err != nil {
+			return nil, fmt.Errorf("invalid table name %q: %w", table, err)
+		}
+		tables = append(tables, TableFQN{Schema: schema, Table: normalized})
+	}
+	batchSize := 1000
+	if config.BatchSize > 0 {
+		batchSize = config.BatchSize
+	}
+	streamMaxRows := streamBatchMaxRows
+	if config.StreamBatchMaxRows > 0 {
+		streamMaxRows = min(streamBatchMaxRows, config.StreamBatchMaxRows)
+	}
+	stream := &Stream{
+		pgConn:                dbConn,
+		messages:              make(chan []StreamMessage, streamChannelDepth),
+		errors:                make(chan error, 1),
+		snapshotAcked:         make(chan struct{}),
+		slotName:              config.ReplicationSlotName,
+		snapshotBatchSize:     batchSize,
+		tables:                tables,
+		maxSnapshotWorkers:    config.MaxSnapshotWorkers,
+		logger:                config.Logger,
+		shutSig:               shutdown.NewSignaller(),
+		includeTxnMarkers:     config.IncludeTxnMarkers,
+		standbyMessageTimeout: config.PgStandbyTimeout,
+		unchangedToastValue:   config.UnchangedToastValue,
+		streamMaxRows:         streamMaxRows,
+	}
+	stream.externallyManagedPublication = config.ExternallyManagedPublication
+
+	monitor, err := NewMonitor(ctx, config, stream.logger, tables, stream.slotName)
+	if err != nil {
+		return nil, err
+	}
+	stream.monitor = monitor
+	cleanups = append(cleanups, func() {
+		if err := monitor.Stop(); err != nil {
+			config.Logger.Warnf("unable to properly cleanup monitor on stream creation failure: %s", err)
+		}
+	})
+
+	if config.HeartbeatInterval > 0 {
+		interval := effectiveHeartbeatInterval(config.HeartbeatInterval, config.IncrementalSnapshotCfg())
+		prefix := "redpanda_connect_" + stream.slotName
+		stream.heartbeat, err = newHeartbeat(config, interval, prefix, `{"type":"heartbeat"}`, stream.incSnapshot.backfilling.Load)
+		if err != nil {
+			return nil, err
+		}
+		stream.heartbeat.Start()
+		cleanups = append(cleanups, func() {
+			if err := stream.heartbeat.Stop(); err != nil {
+				config.Logger.Warnf("unable to properly cleanup heartbeat on stream creation failure: %s", err)
+			}
+		})
+	}
+
+	if stream.pgVersion, err = getPostgresVersion(config); err != nil {
+		return nil, err
+	}
+	if config.ExternallyManagedPublication {
+		if err := checkExternalPublicationVersion(stream.pgVersion); err != nil {
+			return nil, err
+		}
+	}
+
+	pluginArguments := []string{
+		"proto_version '1'",
+		// Sprintf is safe because we validate ReplicationSlotName is alphanumeric in the config
+		fmt.Sprintf("publication_names 'pglog_stream_%s'", config.ReplicationSlotName),
+	}
+
+	// The incremental snapshot advances only on a
+	// decoded COMMIT, which on a quiet table only the heartbeat produces.
+	// PostgreSQL 13 has no "messages" option and refuses the slot. From
+	// PostgreSQL 15 an empty transaction is dropped, so without the decoded
+	// message no BEGIN or COMMIT arrives. Earlier versions still send the
+	// empty transaction, and its BEGIN carries a real xid.
+	if stream.pgVersion > 14 {
+		pluginArguments = append(pluginArguments, "messages 'true'")
+	}
+
+	stream.decodingPluginArguments = pluginArguments
+
+	tablesForPublication := tables
+	// The tables an externally managed publication must already cover. Unlike
+	// tablesForPublication this includes the signal table even when tables is
+	// empty, since a FOR TABLE publication would not stream its rows.
+	tablesRequiredInPublication := tables
+	if config.SignalTableName != "" {
+		signalTable, err := validateSignalTable(ctx, stream, schema, config)
+		if err != nil {
+			return nil, fmt.Errorf("validating signal table: %w", err)
+		}
+		tablesRequiredInPublication = append(slices.Clone(tables), signalTable)
+
+		// An empty tables list means the publication covers FOR ALL TABLES, already including the signal table.
+		// Appending it here would collapse that into a single-table publication and silently stop replicating everything else.
+		if len(tables) > 0 {
+			tablesForPublication = append(slices.Clone(tables), signalTable)
+		}
+
+		// Unquoted, to compare against a decoded row.
+		signalTableID, err := normalizeTableID(schema, config.SignalTableName)
+		if err != nil {
+			return nil, fmt.Errorf("resolving signal table: %w", err)
+		}
+		stream.signalTable = &signalTableID
+	}
+	stream.snapshotSchema = config.DBSchema
+
+	pubName := "pglog_stream_" + config.ReplicationSlotName
+	if config.ExternallyManagedPublication {
+		// Checked on every connect, so a table dropped from the publication
+		// since the last one fails here rather than going silently missing.
+		stream.logger.Infof("Validating externally managed publication %s for tables: %s", pubName, tablesRequiredInPublication)
+		filtered, err := ValidatePublication(ctx, stream.pgConn, pubName, tablesRequiredInPublication)
+		if err != nil {
+			return nil, fmt.Errorf("validating publication: %w", err)
+		}
+		if len(filtered) > 0 {
+			stream.logger.Warnf("Publication %s streams table(s) %s with a row filter or a column list, so only the rows and columns it selects are replicated. The initial snapshot still reads every row and column, and an incremental snapshot signal naming one of them will be rejected.",
+				pubName, filtered)
+		}
+		// Watched while the stream runs, since an externally managed
+		// publication can change at any time and a table dropped from it
+		// simply stops streaming.
+		stream.monitor.WatchPublication(pubName, tablesRequiredInPublication)
+	} else {
+		stream.logger.Infof("Creating publication %s for tables: %s", pubName, tablesForPublication)
+		if err = CreatePublication(ctx, stream.pgConn, pubName, tablesForPublication); err != nil {
+			return nil, err
+		}
+	}
+	cleanups = append(cleanups, func() {
+		// TODO: Drop publication if it was created (meaning it's not existing state we might want to keep).
+	})
+
+	if err := stream.setupIncrementalSnapshot(ctx, config); err != nil {
+		return nil, fmt.Errorf("setting up incremental snapshot: %w", err)
+	}
+	if stream.incSnapshot.conn != nil {
+		cleanups = append(cleanups, func() {
+			if stream != nil && stream.incSnapshot.conn != nil {
+				if err := stream.incSnapshot.conn.Close(); err != nil {
+					config.Logger.Warnf("unable to properly cleanup incremental snapshot connection on stream creation failure: %s", err)
+				}
+			}
+		})
+	}
+
+	query, err := sanitize.SQLQuery("SELECT confirmed_flush_lsn, plugin FROM pg_replication_slots WHERE slot_name = $1", config.ReplicationSlotName)
+	if err != nil {
+		return nil, err
+	}
+	connExecResult, err := stream.pgConn.Exec(ctx, query).ReadAll()
+	if err != nil {
+		return nil, err
+	}
+
+	if len(connExecResult) > 0 && len(connExecResult[0].Rows) > 0 {
+		slotCheckRow := connExecResult[0].Rows[0]
+		confirmedLSNFromDB, err := ParseLSN(string(slotCheckRow[0]))
+		if err != nil {
+			return nil, fmt.Errorf("unable to decode LSN from postgres: %w", err)
+		}
+		outputPlugin := string(slotCheckRow[1])
+		// handling a case when replication slot already exists but with different output plugin created manually
+		if outputPlugin != decodingPlugin {
+			return nil, fmt.Errorf("replication slot %s already exists with different output plugin: %s", config.ReplicationSlotName, outputPlugin)
+		}
+		if confirmedLSNFromDB > 0 {
+			stream.ackedLSNMu.Lock()
+			stream.ackedLSN = confirmedLSNFromDB
+			stream.ackedLSNMu.Unlock()
+		}
+		if config.StreamOldData {
+			for _, table := range tables {
+				stream.monitor.MarkSnapshotComplete(table)
+			}
+		}
+		stream.logger.Debugf("starting stream from LSN %s", confirmedLSNFromDB.String())
+		if stream.incSnapshot.coordinator != nil {
+			if err := stream.incSnapshot.coordinator.Start(ctx); err != nil {
+				return nil, fmt.Errorf("starting incremental snapshot: %w", err)
+			}
+			// Start plans the first chunk, so it decides whether the
+			// heartbeat owes transaction ids before the first tick.
+			stream.incSnapshot.backfilling.Store(!stream.incSnapshot.coordinator.Idle())
+			stream.logger.Debugf("Incremental snapshot: coordinator started")
+		}
+		if err = stream.startLr(ctx, confirmedLSNFromDB); err != nil {
+			return nil, err
+		}
+		go func() {
+			defer stream.shutSig.TriggerHasStopped()
+			if err := stream.streamMessages(confirmedLSNFromDB); err != nil {
+				stream.errors <- fmt.Errorf("logical replication stream error: %w", err)
+			}
+		}()
+		cleanups = nil
+		return stream, nil
+	}
+
+	var snapshotter *snapshotter
+	if config.StreamOldData {
+		stream.IsBlockingSnapshot = true
+		// A crash between snapshot completion and slot promotion leaves <slot>_tmp
+		// behind, owned by the dead session. We only get here when no permanent
+		// slot exists, so any leftover _tmp slot is necessarily stale - drop it
+		// first so CREATE_REPLICATION_SLOT doesn't fail with "already exists" and
+		// crash-loop until the dead session's slot is otherwise reaped.
+		if err := DropReplicationSlot(ctx, stream.pgConn, stream.slotName+"_tmp", DropReplicationSlotOptions{}); err != nil && !strings.Contains(err.Error(), "does not exist") {
+			return nil, fmt.Errorf("dropping stale temporary replication slot: %w", err)
+		}
+
+		var snapshotName string
+		_, snapshotName, err = CreateReplicationSlot(
+			ctx,
+			stream.pgConn,
+			stream.slotName+"_tmp",
+			decodingPlugin,
+			CreateReplicationSlotOptions{Temporary: true, SnapshotAction: "EXPORT_SNAPSHOT"},
+		)
+		if err != nil {
+			return nil, fmt.Errorf("creating temporary replication slot for snapshot: %w", err)
+		}
+
+		snapshotter, err = newSnapshotter(config, config.DBRawDSN, config.Logger, snapshotName, config.MaxSnapshotWorkers)
+		if err != nil {
+			return nil, fmt.Errorf("unable to create snapshotter: %w", err)
+		}
+	}
+
+	go func() {
+		defer stream.shutSig.TriggerHasStopped()
+		ctx, done := stream.shutSig.SoftStopCtx(context.Background())
+		defer done()
+		var startLSN LSN
+		if snapshotter != nil {
+			if err = stream.processSnapshot(ctx, snapshotter); err != nil {
+				stream.errors <- fmt.Errorf("processing snapshot: %w", err)
+				return
+			}
+			for _, table := range tables {
+				stream.monitor.MarkSnapshotComplete(table)
+			}
+
+			// Emit a sentinel so the input layer knows the snapshot is fully
+			// emitted, then block until it confirms every snapshot message has
+			// been acknowledged downstream before promoting the replication
+			// slot. This guarantees a crash during the handoff re-runs the
+			// snapshot on restart instead of losing the un-acked rows: the
+			// permanent slot is only created past this barrier.
+			select {
+			case stream.messages <- []StreamMessage{{Operation: SnapshotCompleteOpType}}:
+			case <-ctx.Done():
+				return
+			}
+			select {
+			case <-stream.snapshotAcked:
+			case <-ctx.Done():
+				return
+			}
+
+			// Now that the snapshot has been processed and durably delivered, we
+			// can copy the replication slot, preserving the LSN but making it not
+			// temporary. This action also expires the snapshot.
+			startLSN, err = CopyReplicationSlot(
+				ctx,
+				stream.pgConn,
+				stream.slotName+"_tmp",
+				stream.slotName,
+				config.TemporaryReplicationSlot,
+			)
+			if err == nil {
+				// Drop our temporary name, we don't need it anymore.
+				err = DropReplicationSlot(
+					ctx,
+					stream.pgConn,
+					stream.slotName+"_tmp",
+					DropReplicationSlotOptions{Wait: false},
+				)
+			}
+			if err != nil {
+				stream.errors <- fmt.Errorf("creating streaming replication slot: %w", err)
+				return
+			}
+		} else {
+			startLSN, _, err = CreateReplicationSlot(
+				ctx,
+				stream.pgConn,
+				stream.slotName,
+				decodingPlugin,
+				CreateReplicationSlotOptions{
+					Temporary:      config.TemporaryReplicationSlot,
+					SnapshotAction: "NOEXPORT_SNAPSHOT",
+				},
+			)
+			if err != nil {
+				stream.errors <- fmt.Errorf("creating replication slot: %w", err)
+				return
+			}
+		}
+		stream.ackedLSNMu.Lock()
+		stream.ackedLSN = startLSN
+		stream.ackedLSNMu.Unlock()
+		if stream.incSnapshot.coordinator != nil {
+			if err := stream.incSnapshot.coordinator.Start(ctx); err != nil {
+				stream.errors <- fmt.Errorf("starting incremental snapshot: %w", err)
+				return
+			}
+			// Start plans the first chunk, so it decides whether the
+			// heartbeat owes transaction ids before the first tick.
+			stream.incSnapshot.backfilling.Store(!stream.incSnapshot.coordinator.Idle())
+			stream.logger.Debugf("Incremental snapshot: coordinator started")
+		}
+		if err := stream.startLr(ctx, startLSN); err != nil {
+			stream.errors <- fmt.Errorf("starting logical replication: %w", err)
+			return
+		}
+		if err := stream.streamMessages(startLSN); err != nil {
+			stream.errors <- fmt.Errorf("logical replication stream error: %w", err)
+		}
+	}()
+
+	// Success! No need to cleanup
+	cleanups = nil
+	return stream, nil
+}
+
+// GetProgress returns the progress of the stream.
+// including the % of snapshot messages processed and the WAL lag in bytes.
+func (s *Stream) GetProgress() *Report {
+	return s.monitor.Report()
+}
+
+func (s *Stream) startLr(ctx context.Context, lsnStart LSN) error {
+	err := StartReplication(
+		ctx,
+		s.pgConn,
+		s.slotName,
+		lsnStart,
+		StartReplicationOptions{
+			PluginArgs: s.decodingPluginArguments,
+		},
+	)
+	if err != nil {
+		return err
+	}
+	s.logger.Debugf("Started logical replication on slot slot-name: %v", s.slotName)
+	return nil
+}
+
+// AckLSN acknowledges the LSN up to which the stream has processed the messages.
+// This makes Postgres to remove the WAL files that are no longer needed.
+func (s *Stream) AckLSN(_ context.Context, lsn string) error {
+	parsed, err := ParseLSN(lsn)
+	if err != nil {
+		return fmt.Errorf("unable to parse LSN: %w", err)
+	}
+	s.ackedLSNMu.Lock()
+	defer s.ackedLSNMu.Unlock()
+	if s.shutSig.IsHardStopSignalled() {
+		return fmt.Errorf("unable to ack LSN %s stream shutting down", lsn)
+	}
+	s.ackedLSN = parsed
+	return nil
+}
+
+func (s *Stream) getAckedLSN() LSN {
+	s.ackedLSNMu.Lock()
+	ackedLSN := s.ackedLSN
+	s.ackedLSNMu.Unlock()
+	return ackedLSN
+}
+
+func (s *Stream) commitAckedLSN(ctx context.Context, lsn LSN) error {
+	err := SendStandbyStatusUpdate(
+		ctx,
+		s.pgConn,
+		StandbyStatusUpdate{
+			WALWritePosition: lsn + 1,
+			ReplyRequested:   true,
+		},
+	)
+	if err != nil {
+		return fmt.Errorf("sending standby status message at LSN %s: %w", lsn, err)
+	}
+	return nil
+}
+
+func (s *Stream) streamMessages(currentLSN LSN) error {
+	var (
+		relations = map[uint32]*RelationMessage{}
+		typeMap   = pgtype.NewMap()
+		// schemaCache maps relation ID to its serialized schema. It is keyed by relation ID
+		// and invalidated whenever a RelationMessage for that ID is received (which PostgreSQL
+		// sends before any DML when the table definition changes).
+		schemaCache = map[uint32]any{}
+		// Every emitted message carries the LSN to acknowledge for it (see
+		// StreamMessage.AckLSN), so the consumer's acks arrive already resolved
+		// to commit records where that matters. These two track the last
+		// emitted message's stamp and the newest commit processed since, so an
+		// ack for that message can be advanced over commits that emitted
+		// nothing (suppressed commits of untracked tables, heartbeats).
+		// "Emitted" means handed to the consumer: both are only advanced when a
+		// batch is flushed.
+		lastEmittedAckLSN    = currentLSN
+		lastEmittedCommitLSN = currentLSN
+		currentTxnCommitTime time.Time
+		currentTxnXid        uint32
+		// Decoded rows are accumulated here and handed to the consumer at commit
+		// boundaries or when a cap is hit, instead of one row per channel send.
+		batch = newStreamBatch(s.streamMaxRows, streamBatchMaxBytes, currentLSN)
+	)
+
+	commitLSN := func(force bool) (committed bool, err error) {
+		// SendStandbyStatusUpdate writes synchronously and ignores its
+		// context, so there is nothing for a cancellable one to interrupt.
+		ctx := context.Background()
+		ackedLSN := s.getAckedLSN()
+		// The consumer acks the stamp of the last row it processed, which is
+		// already a commit record at transaction boundaries. When that stamp
+		// belongs to the last message emitted, every commit processed since
+		// emitted nothing, so the confirmation can advance to the newest one.
+		if ackedLSN == lastEmittedAckLSN {
+			ackedLSN = lastEmittedCommitLSN
+		}
+		if force || ackedLSN > currentLSN {
+			if err := s.commitAckedLSN(ctx, ackedLSN); err != nil {
+				return false, err
+			}
+			// Update the currentLSN
+			currentLSN = ackedLSN
+			return true, nil
+		}
+		return false, nil
+	}
+	defer func() {
+		if _, err := commitLSN(false); err != nil {
+			s.logger.Errorf("unable to acknowledge LSN on stream shutdown: %v", err)
+		}
+	}()
+
+	ctx, done := s.shutSig.SoftStopCtx(context.Background())
+	defer done()
+
+	// flush hands the pending batch to the consumer and promotes the LSN
+	// bookkeeping. It promotes after a successful send, or immediately when
+	// there is nothing to send, so a suppressed commit with no pending rows
+	// still advances lastEmittedCommitLSN.
+	flush := func() error {
+		msgs, promotedAck, promotedCommit := batch.take()
+		if len(msgs) > 0 {
+			select {
+			case s.messages <- msgs:
+			case <-ctx.Done():
+				// The batch was never handed over, so it was never emitted:
+				// leave the bookkeeping where the consumer last saw it. A soft
+				// stop is a clean shutdown, not a stream error.
+				if s.shutSig.IsSoftStopSignalled() {
+					return nil
+				}
+				return ctx.Err()
+			}
+		}
+		if len(msgs) > 0 {
+			lastEmittedAckLSN = promotedAck
+		}
+		lastEmittedCommitLSN = promotedCommit
+		return nil
+	}
+
+	nextStandbyMessageDeadline := time.Now().Add(s.standbyMessageTimeout)
+	// The receive deadline only moves when a standby status update is sent or a
+	// keepalive requests a reply, so build the deadline context once per move
+	// instead of allocating a timer per row.
+	var (
+		recvCtx      context.Context
+		recvCancel   context.CancelFunc = func() {}
+		recvDeadline time.Time
+	)
+	defer func() { recvCancel() }()
+	for !s.shutSig.IsSoftStopSignalled() {
+		if committed, err := commitLSN(time.Now().After(nextStandbyMessageDeadline)); err != nil {
+			return err
+		} else if committed {
+			nextStandbyMessageDeadline = time.Now().Add(s.standbyMessageTimeout)
+		}
+		if recvCtx == nil || !recvDeadline.Equal(nextStandbyMessageDeadline) {
+			recvCancel()
+			var newCancel context.CancelFunc
+			recvCtx, newCancel = context.WithDeadline(ctx, nextStandbyMessageDeadline)
+			recvCancel = newCancel
+			recvDeadline = nextStandbyMessageDeadline
+		}
+		rawMsg, err := s.pgConn.ReceiveMessage(recvCtx)
+		hitStandbyTimeout := errors.Is(err, context.DeadlineExceeded) && ctx.Err() == nil
+		if err != nil {
+			if hitStandbyTimeout || pgconn.Timeout(err) {
+				continue
+			}
+			return fmt.Errorf("receiving messages from Postgres: %w", err)
+		}
+
+		if errMsg, ok := rawMsg.(*pgproto3.ErrorResponse); ok {
+			return fmt.Errorf("received error message from Postgres: %v", errMsg)
+		}
+
+		msg, ok := rawMsg.(*pgproto3.CopyData)
+		if !ok {
+			s.logger.Warnf("received unexpected message: %T", rawMsg)
+			continue
+		}
+
+		if len(msg.Data) == 0 {
+			s.logger.Warn("received malformatted with no data")
+			continue
+		}
+		switch msg.Data[0] {
+		case PrimaryKeepaliveMessageByteID:
+			pkm, err := ParsePrimaryKeepaliveMessage(msg.Data[1:])
+			if err != nil {
+				return fmt.Errorf("parsing PrimaryKeepaliveMessage: %w", err)
+			}
+			if pkm.ReplyRequested {
+				nextStandbyMessageDeadline = time.Time{}
+			}
+
+		// XLogDataByteID is the message type for the actual WAL data
+		// It will cause the stream to process WAL changes and create the corresponding messages
+		case XLogDataByteID:
+			xld, err := ParseXLogData(msg.Data[1:])
+			if err != nil {
+				return fmt.Errorf("parsing XLogData: %w", err)
+			}
+			msgLSN := xld.WALStart + LSN(len(xld.WALData))
+			message, result, err := s.processChange(ctx, msgLSN, xld, relations, typeMap, schemaCache, &currentTxnCommitTime, &currentTxnXid)
+			if err != nil {
+				return fmt.Errorf("decoding postgres changes failed: %w", err)
+			}
+			// A suppressed commit only moves the commit LSN the batch's last row
+			// is stamped with. An emitted message moves both; when that message
+			// is itself the commit marker (include_transaction_markers) it also
+			// closes the transaction.
+			switch result {
+			case changeResultSuppressedCommitMessage:
+				batch.markCommit(msgLSN)
+			case changeResultEmittedMessage:
+				// The caps apply before the next row goes in, not right after
+				// a row lands: a transaction that ends exactly on a cap then
+				// still waits for its commit record, and its last row is
+				// stamped with the commit rather than its own LSN.
+				if batch.full() {
+					if err := flush(); err != nil {
+						return err
+					}
+				}
+				batch.append(*message, len(xld.WALData), msgLSN)
+				if message.Operation == CommitOpType {
+					batch.markCommit(msgLSN)
+				}
+			}
+			// Flush decisions are made only here, on XLogData. The walsender can
+			// interleave keepalive frames between one transaction's XLogData frames
+			// when the client is slow, so rows routinely sit pending across
+			// keepalives; that is harmless because keepalives never flush. What makes
+			// this correct is proto_version 1 (see decodingPluginArguments in
+			// NewPgStream): a transaction's rows always end with its commit record
+			// before the next transaction's rows begin, so a commit-triggered flush
+			// is always a transaction boundary.
+			if batch.commitPending() {
+				if err := flush(); err != nil {
+					return err
+				}
+			}
+		default:
+			return fmt.Errorf("unknown message type: %c", msg.Data[0])
+		}
+	}
+	// clean shutdown, return nil. Anything still pending in the batch was never
+	// handed to the consumer, so it was never acked and will be re-read on restart.
+	return nil
+}
+
+type processChangeResult int
+
+const (
+	changeResultNoMessage               processChangeResult = 0
+	changeResultSuppressedCommitMessage processChangeResult = 1
+	changeResultEmittedMessage          processChangeResult = 2
+)
+
+// processChange decodes one XLogData payload into at most one StreamMessage.
+// It does not send; the caller batches emitted messages (see streamMessages).
+//
+// A commit also drives the incremental snapshot, which sends whatever chunk
+// it releases on the messages channel from here, so those rows precede the
+// committed transaction's own rows, which the caller flushes afterwards. The
+// consumer therefore tracks the snapshot state before the commit position,
+// which is the safe order: the state can never be persisted as progress past
+// a commit that was not confirmed first.
+func (s *Stream) processChange(ctx context.Context, msgLSN LSN, xld XLogData, relations map[uint32]*RelationMessage, typeMap *pgtype.Map, schemaCache map[uint32]any, currentTxnCommitTime *time.Time, currentTxnXid *uint32) (*StreamMessage, processChangeResult, error) {
+	logicalMsg, err := Parse(xld.WALData)
+	if err != nil {
+		return nil, changeResultNoMessage, err
+	}
+
+	// Invalidate the schema cache when a RelationMessage arrives — PostgreSQL sends one
+	// before the first DML after any DDL change, so clearing here ensures the next DML
+	// picks up the updated column definitions.
+	if rel, ok := logicalMsg.(*RelationMessage); ok {
+		delete(schemaCache, rel.RelationID)
+	}
+
+	// capture transaction commit time and xid for insert, update and delete events
+	if begin, ok := logicalMsg.(*BeginMessage); ok {
+		*currentTxnCommitTime = begin.CommitTime
+		*currentTxnXid = begin.Xid
+	} else if _, ok := logicalMsg.(*CommitMessage); ok {
+		if err := s.advanceIncrementalSnapshot(ctx, *currentTxnXid); err != nil {
+			return nil, changeResultNoMessage, err
+		}
+		*currentTxnCommitTime = time.Time{}
+		*currentTxnXid = 0
+	}
+
+	// parse changes inside the transaction
+	message, err := toStreamMessage(logicalMsg, relations, typeMap, s.unchangedToastValue)
+	if err != nil {
+		return nil, changeResultNoMessage, err
+	}
+	if message == nil {
+		// In the case of heartbeats we can treat that the same as suppressed commit messages and advance the LSN that way.
+		// this is only needed for low frequency tables to continue to progress the LSN.
+		if logicalMsg, ok := logicalMsg.(*LogicalDecodingMessage); ok && logicalMsg.Prefix == "redpanda_connect_"+s.slotName {
+			return nil, changeResultSuppressedCommitMessage, nil
+		}
+		return nil, changeResultNoMessage, nil
+	}
+
+	if !s.includeTxnMarkers {
+		switch message.Operation {
+		case CommitOpType:
+			return nil, changeResultSuppressedCommitMessage, nil
+		case BeginOpType:
+			return nil, changeResultNoMessage, nil
+		}
+	}
+
+	// Attach the column schema for DML messages, building it once per relation and
+	// caching by relation ID. The cache entry is cleared above when a RelationMessage
+	// arrives, ensuring DDL changes are reflected on the next DML event.
+	var relID uint32
+	switch msg := logicalMsg.(type) {
+	case *InsertMessage:
+		relID = msg.RelationID
+	case *UpdateMessage:
+		relID = msg.RelationID
+	case *DeleteMessage:
+		relID = msg.RelationID
+	}
+	if relID != 0 {
+		if cached, ok := schemaCache[relID]; ok {
+			message.ColumnSchema = cached
+		} else if rel, ok := relations[relID]; ok {
+			schema := relationMessageToSchema(rel, typeMap)
+			schemaCache[relID] = schema
+			message.ColumnSchema = schema
+		}
+	}
+
+	// A rejected signal is logged there and does not reach here: this row is
+	// not acknowledged yet, so failing redelivers it.
+	if err := s.dispatchSnapshotSignal(ctx, message); err != nil {
+		return nil, changeResultNoMessage, fmt.Errorf("dispatching snapshot signal: %w", err)
+	}
+
+	if err := s.deduplicateStreamedRow(ctx, message); err != nil {
+		return nil, changeResultNoMessage, err
+	}
+
+	message.CommitTime = *currentTxnCommitTime
+	lsn := msgLSN.String()
+	message.LSN = &lsn
+	return message, changeResultEmittedMessage, nil
+}
+
+func (s *Stream) processSnapshot(ctx context.Context, snapshotter *snapshotter) error {
+	if err := snapshotter.Prepare(ctx); err != nil {
+		return fmt.Errorf("unable to prepare snapshot: %w", err)
+	}
+	defer func() {
+		if err := snapshotter.closeConn(); err != nil {
+			s.logger.Warnf("Failed to close database connection: %v", err.Error())
+		}
+	}()
+
+	snapshotTasks := []func(context.Context) error{}
+
+	for _, table := range s.tables {
+		s.logger.Infof("Planning snapshot scan for table: %v", table)
+		planStartTime := time.Now()
+		primaryKeyColumns, err := s.getPrimaryKeyColumn(ctx, table)
+		if err != nil {
+			return fmt.Errorf("getting primary key column for table %v: %w", table, err)
+		}
+		if len(primaryKeyColumns) == 0 {
+			return fmt.Errorf("getting primary key for table %s", table)
+		}
+
+		txn, err := snapshotter.AcquireReaderTxn(ctx)
+		if err != nil {
+			return fmt.Errorf("creating snapshot transaction for snapshot read: %w", err)
+		}
+
+		const overSampleFactor = 32
+		numSamples := min(s.maxSnapshotWorkers, 256) * overSampleFactor
+		splits, err := txn.randomlySampleKeyspace(ctx, table, primaryKeyColumns, numSamples)
+
+		snapshotter.ReleaseReaderTxn(txn)
+
+		if err != nil {
+			return fmt.Errorf("creating sample keyspace: %w", err)
+		}
+
+		var prev primaryKey
+		ranges := [][2]primaryKey{}
+		// We have a sorted key space, sample every N keys to get a uniform distribution.
+		// Use max(1, ...) to avoid chunkSize=0 when splits < maxSnapshotWorkers (e.g. small tables
+		// that fit on a single page produce only one sample), which would otherwise cause an
+		// infinite loop.
+		chunkSize := max(1, len(splits)/s.maxSnapshotWorkers)
+		for i := chunkSize; i < len(splits); i += chunkSize {
+			pk := splits[i]
+			ranges = append(ranges, [2]primaryKey{prev, pk})
+			prev = pk
+		}
+		ranges = append(ranges, [2]primaryKey{prev, nil})
+
+		if len(ranges) > 1 {
+			s.logger.Infof(
+				"created plan in %v to split %s into %d chunks of %d and process in parallel",
+				time.Since(planStartTime),
+				table,
+				len(ranges),
+				chunkSize,
+			)
+		} else {
+			s.logger.Infof(
+				"created plan in %v to scan %s sequentially",
+				time.Since(planStartTime),
+				table,
+			)
+		}
+
+		for _, r := range ranges {
+			start := r[0]
+			end := r[1]
+			snapshotTasks = append(snapshotTasks, func(ctx context.Context) error {
+				s.logger.Debugf("Scanning %s in range (%+v %+v]", table, start, end)
+				err := s.scanTableRange(ctx, snapshotter, table, start, end, primaryKeyColumns)
+				if err != nil {
+					s.logger.Debugf("Finished scanning %s in range (%+v %+v]", table, start, end)
+				}
+				return err
+			})
+		}
+	}
+	s.logger.Debugf("Starting snapshot processing")
+	// Run all the snapshot reads now
+	wg, ctx := errgroup.WithContext(ctx)
+	wg.SetLimit(s.maxSnapshotWorkers)
+	for _, task := range snapshotTasks {
+		wg.Go(func() error { return task(ctx) })
+	}
+	if err := wg.Wait(); err != nil {
+		return err
+	}
+	s.logger.Debugf("Finished snapshot processing")
+	return nil
+}
+
+func (s *Stream) scanTableRange(ctx context.Context, snapshotter *snapshotter, table TableFQN, minExclusive, maxInclusive primaryKey, primaryKeyIndex []string) error {
+	txn, err := snapshotter.AcquireReaderTxn(ctx)
+	if err != nil {
+		return err
+	}
+	defer snapshotter.ReleaseReaderTxn(txn)
+
+	unquotedTable, err := sanitize.UnquotePostgresIdentifier(table.Table)
+	if err != nil {
+		return fmt.Errorf("unexpected failure to unquote table name: %w", err)
+	}
+	unquotedSchema, err := sanitize.UnquotePostgresIdentifier(table.Schema)
+	if err != nil {
+		return fmt.Errorf("unexpected failure to unquote schema name: %w", err)
+	}
+
+	for {
+		queryStart := time.Now()
+		snapshotRows, err := txn.querySnapshotData(ctx, table, minExclusive, maxInclusive, primaryKeyIndex, s.snapshotBatchSize)
+		if err != nil {
+			return fmt.Errorf("querying snapshot data for table %v: %w", table, err)
+		}
+
+		if minExclusive == nil {
+			minExclusive = make(primaryKey, len(primaryKeyIndex))
+		}
+
+		if snapshotRows.Err() != nil {
+			return fmt.Errorf("getting snapshot data for table %v: %w", table, snapshotRows.Err())
+		}
+
+		columnTypes, err := snapshotRows.ColumnTypes()
+		if err != nil {
+			return fmt.Errorf("getting column types for table %v: %w", table, err)
+		}
+		scanArgs, valueGetters := prepareScannersAndGetters(columnTypes)
+
+		columnNames, err := snapshotRows.Columns()
+		if err != nil {
+			return fmt.Errorf("getting column names for table %v: %w", table, err)
+		}
+		pkPosition := make([]int, len(columnNames))
+		for i, col := range columnNames {
+			normalized := sanitize.QuotePostgresIdentifier(col)
+			pkPosition[i] = slices.Index(primaryKeyIndex, normalized)
+		}
+
+		// Build the table schema once per batch for snapshot messages.
+		tableSchema := columnTypesToSchema(unquotedTable, columnNames, columnTypes)
+
+		rowsCount := 0
+		batch := make([]StreamMessage, 0, s.snapshotBatchSize)
+		rowsStart := time.Now()
+		for snapshotRows.Next() {
+			rowsCount += 1
+
+			if err := snapshotRows.Scan(scanArgs...); err != nil {
+				return fmt.Errorf("scanning row for table %v: %v", table, err.Error())
+			}
+
+			data := make(map[string]any, len(valueGetters))
+			for i, getter := range valueGetters {
+				col := columnNames[i]
+				var val any
+				if val, err = getter(scanArgs[i]); err != nil {
+					return fmt.Errorf("unable to decode column %s: %w", col, err)
+				}
+				data[col] = val
+				if j := pkPosition[i]; j != -1 {
+					minExclusive[j] = val
+				}
+			}
+			batch = append(batch, StreamMessage{
+				LSN:          nil,
+				Operation:    ReadOpType,
+				Table:        unquotedTable,
+				Schema:       unquotedSchema,
+				Data:         data,
+				ColumnSchema: tableSchema,
+			})
+		}
+		s.monitor.UpdateSnapshotProgressForTable(table, rowsCount)
+		if snapshotRows.Err() != nil {
+			return fmt.Errorf("closing snapshot data iterator for table %v: %w", table, snapshotRows.Err())
+		}
+		sendStartTime := time.Now()
+		select {
+		case s.messages <- batch:
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-s.shutSig.SoftStopChan():
+			return nil
+		}
+		s.logger.Tracef("Query duration: %v %s \n", rowsStart.Sub(queryStart), table)
+		s.logger.Tracef("Scan duration %v %s\n", sendStartTime.Sub(rowsStart), table)
+		s.logger.Tracef("Send duration %v %s\n", time.Since(sendStartTime), table)
+
+		if rowsCount < s.snapshotBatchSize {
+			break
+		}
+	}
+	return nil
+}
+
+// Messages is a channel that can be used to consume messages from the plugin. It will contain LSN nil for snapshot messages.
+func (s *Stream) Messages() chan []StreamMessage {
+	return s.messages
+}
+
+// MarkSnapshotAcknowledged is called by the input layer once every snapshot
+// message has been acknowledged downstream, unblocking promotion of the
+// replication slot. Safe to call multiple times.
+func (s *Stream) MarkSnapshotAcknowledged() {
+	s.snapshotAckedOnce.Do(func() { close(s.snapshotAcked) })
+}
+
+// Errors is a channel that can be used to see if and error has occurred internally and the stream should be restarted.
+func (s *Stream) Errors() chan error {
+	return s.errors
+}
+
+// undedupableTablesQuery lists the partitioned parents in a schema when the
+// publication does not republish their changes under the parent's name. It
+// returns nothing when the publication does, since there is then nothing a
+// backfill could not deduplicate.
+func undedupableTablesQuery(schema, publication string) (string, error) {
+	return sanitize.SQLQuery(`
+        SELECT c.relname
+        FROM   pg_class c
+        JOIN   pg_namespace n ON n.oid = c.relnamespace
+        WHERE  c.relkind = 'p'
+        AND    n.nspname = $1
+        AND    NOT COALESCE((SELECT p.pubviaroot FROM pg_publication p WHERE p.pubname = $2), false)
+        ORDER BY c.relname;
+    `, schema, publication)
+}
+
+// toastFidelityQuery reports whether a table replicates full old tuples, and
+// whether it has any column large enough to be stored out of line.
+func toastFidelityQuery(table string) (string, error) {
+	return sanitize.SQLQuery(`
+        SELECT c.relreplident = 'f',
+               EXISTS (SELECT 1
+                       FROM   pg_attribute a
+                       WHERE  a.attrelid = c.oid
+                       AND    a.attnum > 0
+                       AND    NOT a.attisdropped
+                       AND    a.attstorage IN ('x', 'e'))
+        FROM   pg_class c
+        WHERE  c.oid = $1::regclass;
+    `, table)
+}
+
+// primaryKeyColumnsQuery returns the query used to resolve table's primary
+// key columns, in index order.
+func primaryKeyColumnsQuery(table string) (string, error) {
+	return sanitize.SQLQuery(`
+        SELECT a.attname
+        FROM   pg_index i
+        JOIN   pg_attribute a ON a.attrelid = i.indrelid
+            AND a.attnum = ANY(i.indkey)
+        WHERE  i.indrelid = $1::regclass
+        AND    i.indisprimary
+        ORDER BY array_position(i.indkey, a.attnum);
+    `, table)
+}
+
+// getPrimaryKeyColumn resolves table's primary key columns over s.pgConn.
+// Only safe to call before logical replication starts (COPY BOTH mode) --
+// s.pgConn is the dedicated replication protocol connection from that point
+// on, and issuing a plain Exec on it concurrently corrupts/deadlocks the
+// stream. Callers that may run once streaming has started (e.g. incremental
+// snapshot's PK resolution) must instead use resolveIncrementalPKColumns,
+// which queries over s.incSnapshot.conn.
+func (s *Stream) getPrimaryKeyColumn(ctx context.Context, table TableFQN) ([]string, error) {
+	q, err := primaryKeyColumnsQuery(table.String())
+	if err != nil {
+		return nil, fmt.Errorf("sanitizing query: %w", err)
+	}
+
+	reader := s.pgConn.Exec(ctx, q)
+	data, err := reader.ReadAll()
+	if err != nil {
+		return nil, fmt.Errorf("reading query results: %w", err)
+	}
+
+	if len(data) == 0 || len(data[0].Rows) == 0 {
+		return nil, fmt.Errorf("no primary key found for table %s", table)
+	}
+
+	// Extract all primary key column names
+	pkColumns := make([]string, len(data[0].Rows))
+	for i, row := range data[0].Rows {
+		// Postgres gives us back normalized identifiers here - we need to quote them.
+		pkColumns[i] = sanitize.QuotePostgresIdentifier(string(row[0]))
+	}
+
+	return pkColumns, nil
+}
+
+// Stop closes the stream (hopefully gracefully).
+func (s *Stream) Stop(ctx context.Context) error {
+	s.shutSig.TriggerSoftStop()
+	var wg errgroup.Group
+	stopNowCtx, done := s.shutSig.HardStopCtx(ctx)
+	defer done()
+	wg.Go(func() error {
+		// Wait for streamMessages to finish using pgConn (and, if incremental
+		// snapshotting is enabled, incSnapshot.conn) before closing them,
+		// otherwise we race on pgconn internal state (lock field, write buffer)
+		// or on a connection that's mid-query.
+		select {
+		case <-s.shutSig.HasStoppedChan():
+		case <-stopNowCtx.Done():
+		}
+		var errs []error
+		if err := s.pgConn.Close(stopNowCtx); err != nil {
+			errs = append(errs, err)
+		}
+		if s.incSnapshot.conn != nil {
+			if err := s.incSnapshot.conn.Close(); err != nil {
+				errs = append(errs, err)
+			}
+		}
+		return errors.Join(errs...)
+	})
+	wg.Go(func() error {
+		return s.monitor.Stop()
+	})
+	wg.Go(func() error {
+		if s.heartbeat != nil {
+			return s.heartbeat.Stop()
+		}
+		return nil
+	})
+	select {
+	case <-ctx.Done():
+	case <-s.shutSig.HasStoppedChan():
+		return wg.Wait()
+	}
+	s.shutSig.TriggerHardStop()
+	err := wg.Wait()
+	select {
+	case <-time.After(time.Second):
+		if err == nil {
+			return errors.New("unable to cleanly shutdown postgres logical replication stream")
+		}
+	case <-s.shutSig.HasStoppedChan():
+	}
+	return err
+}
+
+var requiredSignalTableColumns = []string{"id", "type", "data"}
+
+// validateSignalTable verifies the signal table exists and has the
+// documented id/type/data columns.
+func validateSignalTable(ctx context.Context, stream *Stream, schema string, config *Config) (TableFQN, error) {
+	normalizedSignalTable, err := sanitize.NormalizePostgresIdentifier(config.SignalTableName)
+	if err != nil {
+		return TableFQN{}, fmt.Errorf("invalid signal table name %q: %w", config.SignalTableName, err)
+	}
+	signalTable := TableFQN{Schema: schema, Table: normalizedSignalTable}
+
+	wireSchema, err := sanitize.UnquotePostgresIdentifier(signalTable.Schema)
+	if err != nil {
+		return TableFQN{}, fmt.Errorf("verifying schema: %w", err)
+	}
+	wireSignalTable, err := sanitize.UnquotePostgresIdentifier(signalTable.Table)
+	if err != nil {
+		return TableFQN{}, fmt.Errorf("verifying signal table name: %w", err)
+	}
+	sql := "SELECT column_name FROM information_schema.columns WHERE table_schema = $1 AND table_name = $2"
+	query, err := sanitize.SQLQuery(sql, wireSchema, wireSignalTable)
+	if err != nil {
+		return TableFQN{}, err
+	}
+	res, err := stream.pgConn.Exec(ctx, query).ReadAll()
+	if err != nil {
+		return TableFQN{}, fmt.Errorf("checking signal table %s columns: %w", signalTable, err)
+	}
+	if len(res) == 0 || len(res[0].Rows) == 0 {
+		return signalTable, fmt.Errorf("signal table %s does not exist", signalTable)
+	}
+
+	columns := make(map[string]bool, len(res[0].Rows))
+	for _, row := range res[0].Rows {
+		columns[string(row[0])] = true
+	}
+	var missing []string
+	for _, required := range requiredSignalTableColumns {
+		if !columns[required] {
+			missing = append(missing, required)
+		}
+	}
+	if len(missing) > 0 {
+		return signalTable, fmt.Errorf("signal table %s is missing required column(s): %s", signalTable, strings.Join(missing, ", "))
+	}
+
+	return signalTable, nil
+}
