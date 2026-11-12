@@ -123,11 +123,11 @@ jobs:
     outputs:
       changed: ${{ steps.compare.outputs.changed }}
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           name: connect-docs-head
           path: head
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           name: connect-docs-base
           path: base
