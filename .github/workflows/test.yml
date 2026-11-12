@@ -13,7 +13,7 @@ jobs:
       CGO_ENABLED: 1
     steps:
       - name: Checkout code
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
         with:
           # TestNewSpecsHaveVersions reads the previous release tag.
           fetch-depth: 0
@@ -42,7 +42,7 @@ jobs:
       CGO_ENABLED: 1
     steps:
       - name: Checkout code
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
         with:
           # TestNewSpecsHaveVersions reads the release tags.
           fetch-depth: 0
@@ -85,7 +85,7 @@ jobs:
       CGO_ENABLED: 1
     steps:
       - name: Checkout code
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
         with:
           fetch-depth: 0
       # The docs job builds the merge commit GitHub made for this PR, so build
@@ -170,7 +170,7 @@ jobs:
       CGO_ENABLED: 0
     steps:
       - name: Checkout code
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
       - name: Install Go
         uses: ./.github/actions/setup-go
 
@@ -196,7 +196,7 @@ jobs:
       CGO_ENABLED: 0
     steps:
       - name: Checkout code
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
       # Use a separate cache key. With the default key (root go.sum), this job saves first, and test and
       # golangci-lint then restore a cache without the root module's build output.
       - name: Install Go
@@ -254,7 +254,7 @@ jobs:
     steps:
 
       - name: Checkout code
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
 
       - name: Set up test packages
         run: |

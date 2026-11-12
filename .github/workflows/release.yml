@@ -35,7 +35,7 @@ jobs:
     steps:
 
       - name: Check Out Repo
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
 
       - name: Configure AWS credentials for access to AWS Secrets Manager
         uses: aws-actions/configure-aws-credentials@v6.2.4
@@ -202,7 +202,7 @@ jobs:
     env:
       DOCS_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.docs_tag || github.ref_name }}
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           ref: refs/tags/${{ env.DOCS_TAG }}
       - uses: actions/setup-go@v6
@@ -327,7 +327,7 @@ jobs:
     outputs:
       pr_url: ${{ steps.pr.outputs.url }}
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - uses: actions/setup-go@v6
         with:
           go-version-file: 'go.mod'
