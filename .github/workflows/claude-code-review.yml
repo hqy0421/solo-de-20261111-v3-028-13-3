@@ -92,7 +92,7 @@ jobs:
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
         with:
           fetch-depth: 1
           persist-credentials: false
@@ -101,7 +101,7 @@ jobs:
       # the PR can change. Check out only the scripts, from the BASE ref, next to the PR checkout.
       # The PR that adds the scripts has none on its base, so its review fails once.
       - name: Checkout review scripts from the base ref
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
         with:
           ref: ${{ github.event.pull_request.base.sha }}
           path: review-base
